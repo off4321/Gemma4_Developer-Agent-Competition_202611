@@ -289,7 +289,31 @@ def load_base(args: argparse.Namespace, model_path: str):
     return model
 
 
-def build_lora_config(args: argparse.Namespace) -> LoraConfig:
+def resolve_target_modules(model, raw_targets: str) -> list[str]:
+    """Resolve target module names to actual `nn.Linear` paths, avoiding `Gemma4ClippableLinear`."""
+    wanted = [m.strip() for m in raw_targets.split(",") if m.strip()]
+    if model is None:
+        return wanted
+    wanted_set = set(wanted)
+    skip_prefixes = ("vision_tower", "audio_tower", "vision_model", "audio_model")
+    matched: list[str] = []
+    for name, mod in model.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        parts = name.split(".")
+        if any(p in skip_prefixes for p in parts):
+            continue
+        leaf = parts[-1]
+        parent_leaf = parts[-2] if len(parts) >= 2 else ""
+        if leaf in wanted_set or (leaf == "linear" and parent_leaf in wanted_set):
+            matched.append(name)
+    if matched:
+        print(f"[model] resolved {len(matched)} linear LoRA targets (skipped vision/audio & wrappers)")
+        return sorted(matched)
+    return wanted
+
+
+def build_lora_config(args: argparse.Namespace, model=None) -> LoraConfig:
     return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.r,
@@ -297,7 +321,7 @@ def build_lora_config(args: argparse.Namespace) -> LoraConfig:
         lora_dropout=args.dropout,
         bias="none",
         use_rslora=getattr(args, "use_rslora", False),
-        target_modules=[m.strip() for m in args.target_modules.split(",") if m.strip()],
+        target_modules=resolve_target_modules(model, args.target_modules),
     )
 
 
@@ -426,7 +450,7 @@ def main() -> int:
     dataset = build_dataset(tokenizer, load_examples(args.data, args.max_examples), args)
     model = load_base(args, model_path)
     if args.resume_from is None:
-        model = get_peft_model(model, build_lora_config(args))
+        model = get_peft_model(model, build_lora_config(args, model))
     model.print_trainable_parameters()
 
     if args.dry_run:

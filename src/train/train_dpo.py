@@ -107,7 +107,7 @@ def main() -> int:
     dataset = load_dpo_dataset(args.data, tokenizer, args.max_examples)
     model = load_base(args, model_path)
     if args.resume_from is None:
-        model = get_peft_model(model, build_lora_config(args))
+        model = get_peft_model(model, build_lora_config(args, model))
     model.print_trainable_parameters()
 
     if args.dry_run:
