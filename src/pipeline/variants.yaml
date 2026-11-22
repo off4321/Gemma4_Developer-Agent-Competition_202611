@@ -1,0 +1,136 @@
+# ============================================================================
+# パイプラインの variant。src/pipeline/config.py が defaults に deep merge する。
+# src/ は dataset <you>/gemma4-dev-agent-code として Kaggle に上がるので、
+# **同じファイルを手元と kernel の両方**が読む。kernel が渡すのは variant 名だけ。
+#
+#   variant 一覧  : python3 src/pipeline/run_pipeline.py --list-variants
+#   手元で検査    : make pipeline-local VARIANT=baseline
+#   Kaggle で実行 : make pipeline-eval VARIANT=baseline    （GPU quota を消費する）
+#
+# variant 名がそのまま run_name になる（variant / CLI が名前を明示しない限り）。
+# だから results/<variant>・manifest・analyze の RUN が全部揃う。
+# ============================================================================
+
+defaults:
+  run_name: baseline
+  model_name: gemma-4-e4b-it-qat-w4a16-ct   # 4 種の -ct モデルから 1 個（HARNESS_README 3.2）
+  task_limit: 12            # 0 = 公開 task 全部（5-12 h: 週 30 h quota を使い切る）
+  task_ids: []              # 例 [fastapi_15588, rich_12345]。少ない task で高速に確認する
+  shard_index: 0            # `swegemma eval --shard-index/--num-shards` と同じ: index % M == k
+  num_shards: 1
+  adapter_mode: "off"       # off = adapters/ を外す（ベースライン）, use = adapter を使う
+                            # 注: YAML 1.1 は off/on を bool と読むので必ず引用符で囲む
+  sandbox: subprocess       # Kaggle notebook には docker daemon が無い
+  graph_smoke: true         # cell 3 のシンボルグラフ smoke test
+  smoke_test: true          # ループ前に 1 回の短い completion で model/adapter を確かめる
+  rewrite_model: true       # agent YAML の `model:` を model_name に書き換える（cell 2 相当）
+  pip_fallback: true         # setup: vllm が wheelhouse から入らないとき、import error 名だけ
+                             # PyPI から補う（internet 可の測定 kernel 限り。false で止める）
+  vllm_version: "0.28.0"    # 測定だけ载せ替える vLLM。0.28.0 は Turing (sm75) の shared memory 問題が
+                             # upstream で直っている（wheelhouse の 0.19.1 は Gemma4 を T4 で生成できない:
+                             # doc/environment_limits.md §5）。sm89 (L4) で測るときは "" にすると pin に戻る。
+                             # model は同じ 4bit QAT checkpoint のまま。差は manifest の hardware に残す
+
+  # staged agent_dir/eval_config.yaml の evaluation: に書かれる（スコア側が読むもの）
+  budget:
+    timeout_seconds: 300                 # Phase 1 の 1 コマンド上限
+    verification_timeout_seconds: 300    # 注意: スコア側は 300 s 固定（書いても上書きされる）
+    max_tool_calls: 80                   # 残り 10 以下で tool 応答に budget_warning が入る
+    max_time_minutes: 45                 # agent loop の実時間だけ（コンテナ準備は時間外）
+    max_turns: 150                       # nudge 3 回で打ち切り。小さすぎると submit 前に終わる
+
+  # staged agent_dir/configs/sampling.yaml に書かれる
+  sampling:
+    temperature: 0.2
+    max_output_tokens: 16384   # 4096 に下げると <|tool_call> が生成途中で切れる典型
+    thinking_budget: 4096      # 0 で思考なし。tool call と 32k window を奪い合う量
+    include_thoughts: true
+
+variants:
+  # --- phase 1: 基準線（doc/tasks.md T3）--------------------------------------
+  baseline: {}
+
+  # 短くて安い: 3 task + graph smoke なし -> 「配線は生きているか」の確認
+  smoke:
+    task_limit: 3
+    graph_smoke: false
+    smoke_test: true
+    # smoke は「配管が通るか」の確認で、精度を見る run ではない。だから budget を締めて
+    # GPU quota を守る（3 task × 45 min = 2.25 h を配管確認で捨てるのが一番高い）。
+    # 本来の計測は baseline でやること（doc/tasks.md T3）。
+    budget: {max_time_minutes: 12, max_tool_calls: 40, max_turns: 80}
+
+  # --- phase 2: 1 つ変えて 1 run のスイープ（doc/tasks.md T5）-----------------
+  think_0:
+    sampling: {thinking_budget: 0}
+  think_2048:
+    sampling: {thinking_budget: 2048}
+
+  calls_40:
+    budget: {max_tool_calls: 40}
+  calls_120:
+    budget: {max_tool_calls: 120}
+
+  out_8192:
+    sampling: {max_output_tokens: 8192}
+
+  # --- phase 3: LoRA を同じ基準線と比較（doc/lora_plan.md）--------------------
+  lora:
+    adapter_mode: use
+  lora_think0:
+    adapter_mode: use
+    sampling: {thinking_budget: 0}
+
+  # --- 公開 task 全部を quota の中に分割して流す ------------------------------
+  full_a: {task_limit: 0, shard_index: 0, num_shards: 3}
+  full_b: {task_limit: 0, shard_index: 1, num_shards: 3}
+  full_c: {task_limit: 0, shard_index: 2, num_shards: 3}
+
+  # --- 測定だけ T4 で生成できるようにする実験 ---------------------------------
+  # wheelhouse の vllm 0.19.1 は Gemma4 の head_dim 256/512 を Turing (sm75) の shared memory 64 KB に
+  # 収められず生成 0 token（doc/environment_limits.md §5）。upstream の修正は新しい版に入っている。
+  # model は 4bit QAT (w4a16) のまま、**vLLM の version だけ**上げて 1 task で生成を確認する。
+  # vllm_version は defaults で 0.28.0（上）。この variant は「生成が動くか」を 1 task で安く見る probe。
+  t4fix:
+    task_limit: 1            # 生成が動くかを見るだけ。通ったら baseline に同じ vllm_version を足す
+    task_ids: [fastapi_15661]
+    graph_smoke: false
+    budget: {max_time_minutes: 8, max_tool_calls: 30, max_turns: 60}
+
+  # --- Colab L4 (sm89) で測る（公式 env に一番近い測定環境）---------------------------
+  # 実測: NVIDIA L4 23034 MiB, compute_cap 8.9, torch 2.14.1+cu130, python 3.13.16,
+  # disk 236 GB, RAM 52 GB（doc/environment_limits.md §6）。L4 は公式採点と同じ型号で
+  # shared memory 101376 なので wheelhouse pin の vLLM で Gemma4 attention が通るはず ->
+  # vllm_version: "" で pin (0.19.1) に戻す。差は GPU 1 枚（公式 4 枚 tp=4 -> ここ tp=1）。
+  colab:
+    vllm_version: ""         # 公式 wheelhouse の pin に戻す（L4 は sm89なので T4 の壁が無い）
+    task_limit: 3
+    graph_smoke: false
+    budget: {max_time_minutes: 12, max_tool_calls: 40, max_turns: 80}
+
+  # Colab の配線確認を 1 task で見る probe（data/model の置き場所が正しく読めるかの検査）
+  colab_probe:
+    vllm_version: ""
+    task_limit: 1
+    task_ids: [fastapi_15661]
+    graph_smoke: false
+    budget: {max_time_minutes: 8, max_tool_calls: 30, max_turns: 60}
+
+  # Colab L4 (sm89) で基線を出す 12 task run。公式 pin の vLLM、budget はスコア側に合わせてある。
+  # 前提: snapshots を先頭 12 個落としてある（colab_bootstrap の TASK_LIMIT=12）。
+  # 12 task x 15 min 上限 = 最大 3 h。compute units 実測 1.94/h -> 約 6 units。
+  colab12:
+    vllm_version: ""
+    task_limit: 12
+    graph_smoke: false
+    budget: {max_time_minutes: 15, max_tool_calls: 80, max_turns: 150}
+
+  # Kaggle notebook でセル実行して測る variant（make_measure_notebook.py が VARIANT に使う既定）。
+  # T4 (sm75) では wheelhouse pin 0.19.1 が Gemma4 を生成できないので vllm_version は 0.28.0
+  # （測定だけ载せ替え。model は同じ 4bit QAT、差は manifest の hardware に残す: doc/environment_limits.md §5）。
+  # 6 task x 20 min = 2 h 目安（1 run 2 h / 週 30 h）。12 task 測るなら shard_index/num_shards で割る。
+  kaggle_nb:
+    vllm_version: "0.28.0"
+    task_limit: 6
+    graph_smoke: true
+    budget: {max_time_minutes: 20, max_tool_calls: 80, max_turns: 150}

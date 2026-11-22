@@ -1,0 +1,12 @@
+# Generation constraints (HARNESS_README §2.4 GenerationConstraints).
+# Allowed top-level fields ONLY:
+#   temperature, top_p, top_k, max_output_tokens, presence_penalty,
+#   frequency_penalty, stop_sequences, response_mime_type, seed, thinking_config
+# -> `thinking_budget` / `include_thoughts` MUST live under `thinking_config`.
+temperature: 0.2
+top_p: 0.95
+max_output_tokens: 16384        # >= 8192 recommended: 4096 truncates <|tool_call|> mid-call
+thinking_config:
+  thinking_budget: 4096         # 0 disables thinking; <= 32768 (vLLM max_model_len)
+  include_thoughts: true        # keep thought parts in history (helps tool-call continuity)
+  # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm

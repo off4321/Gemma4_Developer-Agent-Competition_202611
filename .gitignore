@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# staging created by `make push-code` / `make push-submission`
+.kaggle/dataset-code/src/
+.kaggle/dataset-submission/agent.yaml
+.kaggle/dataset-submission/eval_config.yaml
+.kaggle/dataset-submission/prompts/
+.kaggle/dataset-submission/configs/
+.kaggle/dataset-submission/sub_agents/
+.kaggle/dataset-submission/adapters/
+
+# bulky data pulled from Kaggle / produced by runs
+data/*.jsonl
+data/HARNESS_README.md
+data/snapshots/
+data/wheels/
+data/wheelhouse/
+results/
+work/
+# 生成された Kaggle kernel notebook（source of truth は kernels/*/<name>.py）
+kernels/**/*.ipynb
+adapters_out/
+submission.zip
+adapters/

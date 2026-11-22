@@ -1,0 +1,10 @@
+# Per-task operational budgets, read by scripts/inference.py via `load_submission_eval_config`
+# ONLY when this file is at the ROOT of submission.zip and wrapped in `evaluation:`.
+# Defaults on the scorer: max_time_minutes=60, max_tool_calls=100, max_turns=500,
+# command timeout 300s, verification timeout 300s (fixed).
+# Container A is 4 GiB RAM / 2 vCPU and air-gapped: long test suites are the usual killer.
+evaluation:
+  timeout_seconds: 300          # per-command timeout (Phase 1)
+  max_tool_calls: 80            # >= 40 recommended; submit_patch/get_status are FREE
+  max_time_minutes: 45          # agent-loop wall clock only (container setup excluded)
+  max_turns: 150                # 20 is too small: turn cap + 3 nudges terminates before submit_patch

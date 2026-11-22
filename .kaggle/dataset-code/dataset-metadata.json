@@ -1,0 +1,11 @@
+{
+  "title": "gemma4-dev-agent-code",
+  "id": "<username>/gemma4-dev-agent-code",
+  "is_private": "True",
+  "licenses": [
+    {
+      "name": "CC0-1.0"
+    }
+  ],
+  "subtitle": "src/ pipeline stages + variants.yaml (Gemma 4 Developer Agent)"
+}

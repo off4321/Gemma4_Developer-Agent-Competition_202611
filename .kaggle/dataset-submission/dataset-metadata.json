@@ -1,0 +1,16 @@
+{
+  "title": "gemma4-dev-agent-submission",
+  "id": "<username>/gemma4-dev-agent-submission",
+  "is_private": "True",
+  "resources": [
+    {
+      "path": "agent.yaml",
+      "description": "root agent config (must sit at the root of submission.zip)"
+    }
+  ],
+  "licenses": [
+    {
+      "name": "CC0-1.0"
+    }
+  ]
+}

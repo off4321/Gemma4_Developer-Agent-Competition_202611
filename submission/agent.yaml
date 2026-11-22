@@ -1,0 +1,27 @@
+# ============================================================================
+# Root agent config. MUST be at the ROOT of submission.zip.
+# Contract: HARNESS_README.md §2.2 / §3.2 (single declared model rule)
+# ============================================================================
+name: gemma_e4b_developer_agent
+model: gemma-4-e4b-it-qat-w4a16-ct          # must be one of ALLOWED_MODEL_NAMES
+# adapter: main_lora                         # uncomment only after adapters/main_lora/ exists
+instruction: !include prompts/system.md
+tools:
+  # execution / lifecycle
+  - run_command
+  - get_status
+  - submit_patch
+  # workspace file tools
+  - read_file
+  - edit_file
+  - write_file
+  # code intelligence (graphs/*.json + embeddings/*.npz are pre-computed)
+  - get_code_neighbors
+  - search_similar_code
+  - get_code_subgraph
+  # read-only explorer wrapped as AgentTool: keeps exploration noise out of
+  # this agent's 32k context window (HARNESS_README §10.4)
+  - agent_tool:
+      config_path: sub_agents/code_analyzer.yaml
+      skip_summarization: true
+generate_content_config: !include configs/sampling.yaml
