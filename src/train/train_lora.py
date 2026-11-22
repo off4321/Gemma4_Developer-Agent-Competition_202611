@@ -19,14 +19,17 @@ max_len を 4096 に落とす。Kaggle の T4x2（bf16 非対応）では fp16 �
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
@@ -283,6 +286,8 @@ def load_base(args: argparse.Namespace, model_path: str):
         print(f"[model] resumed adapter from {args.resume_from}")
     elif args.use_4bit:
         model = prepare_for_kbit_training(model)
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
