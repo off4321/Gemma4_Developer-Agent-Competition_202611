@@ -20,7 +20,7 @@ VARIANT     ?= baseline
 STAGES      ?= gpu
 
 .PHONY: help validate zip collect analyze quota push-code push-submission push-eval push-train \
-        measure-notebook push-measure-notebook colab-notebook colab-notebook-hf parity failures scoreboard scoreboard-official scoreboard-table \
+        measure-notebook push-measure-notebook colab-notebook colab-notebook-hf train-notebook parity failures scoreboard scoreboard-official scoreboard-table \
         status logs logs-follow out-eval out-train submit submissions clean all \
         pipeline-variants pipeline-plan pipeline-local pipeline-post pipeline-eval pipeline-eval-save \
         pipeline-run pipeline-run-save set-variant strip-pycache kernel-ipynb kernel-ipynb-probe probe probe-out logs-dump
@@ -147,6 +147,10 @@ colab-notebook:                              # 既定の 1 冊（Kaggle 資材�
 
 colab-notebook-hf:                           # 同じ notebook の HF 資材モード（Kaggle を触らない）
 	python3 src/pipeline/make_colab_notebook.py --source hf
+
+# 学習 notebook（kernels/colab/gemma4_lora_train_notebook.ipynb / Colab で RFT + DPO）
+train-notebook:
+	python3 src/pipeline/make_train_notebook.py
 
 parity:                                      # 公式 harness 出力と自分の pipeline 出力を突き合わせる
 	python3 src/pipeline/parity_check.py --a $(A) --b $(B) --label 公式harness 自分のpipeline

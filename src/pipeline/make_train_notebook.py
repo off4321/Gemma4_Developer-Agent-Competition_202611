@@ -64,7 +64,8 @@ def build_notebook() -> nbf.NotebookNode:
             # Gemma 4 e4b — RFT + DPO Multi-LoRA Training (Colab)
 
             Colab 上でリポジトリを clone し、**RFT（自己成功軌跡＋gold合成 SFT）→ DPO（成功/失敗ペア選好学習）** で
-            `main_lora` / `analyzer_lora` を作成・検証するためのノートブックです。
+            `main_lora` / `analyzer_lora` / `verifier_lora` の 3 本を作成・検証するためのノートブックです。
+            1 セット（cell 1 → 6）で 1 本学習できるので、`ADAPTER_NAME` / `ROLE` を切り替えて 3 周してください。
 
             - **RSLoRA** (`--use_rslora`): 高ランクでも勾配が潰れにくい
             - **LoRA+** (`--lora_plus_ratio 16.0`): `lora_B` の学習率を上げてコード・ツール形式の収束を高速化
@@ -72,7 +73,8 @@ def build_notebook() -> nbf.NotebookNode:
 
             cell 1 → 2 → 3 → 4 → 5 → 6 の順に実行します。cell 1 の `pip install` で Colab が「ランタイムを再起動」と
             出したら、再起動してから cell 2 以降を続けてください（未再起動だと transformers / peft の import が
-            混ざって落ちます）。`data/tasks.jsonl` と eval 軌跡入りの `results/` は cell 2 の clone 後にアップロードします。
+            混ざって落ちます）。`data/tasks.jsonl` は cell 2 が Kaggle から自動 download します（token が無いときだけ
+            Files パネルにアップロード）。eval 軌跡入りの `results/` は相変わらず手動アップロードです。
             """
         ),
         _md(
@@ -80,7 +82,10 @@ def build_notebook() -> nbf.NotebookNode:
             ## Cell 1 — GPU確認 & 依存インストール
 
             `nvidia-smi` で L4 GPU が当たっているかを確認し、`pip install` で `peft` / `datasets` / `trl` /
-            `accelerate` / `bitsandbytes` / `pyyaml` を導入します。
+            `accelerate` / `bitsandbytes` / `pyyaml` / `kaggle` を導入します。
+
+            `kaggle` を一緒に入れるのは cell 2 が `data/tasks.jsonl` を competition から落とすためです（Colab 同梱の
+            `kaggle` は import で死ぬので、ここで上書きしておくと credential も素直に読めます）。
 
             **インストール後に Colab が「ランタイムを再起動」するダイアログを出したら、必ず再起動してから
             cell 2 以降を実行してください。** 再起動を飛ばすと Colab 既定版と新規版のライブラリが混ざって
@@ -91,45 +96,71 @@ def build_notebook() -> nbf.NotebookNode:
             """
             #@title 1. GPU確認 & 依存インストール
             !nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-            !pip install -q -U peft datasets trl accelerate bitsandbytes pyyaml
+            !pip install -q -U peft datasets trl accelerate bitsandbytes pyyaml kaggle
             """
         ),
         _md(
             """
-            ## Cell 2 — リポジトリの clone / 更新 & HF ログイン（Colab Secrets の `HF_TOKEN`）
+            ## Cell 2 — リポジトリ clone / 更新 & Kaggle / HF 認証 + `data/tasks.jsonl` 取得
 
-            `REPO_URL` を自分のリポジトリに向けて clone（2回目以降は `git pull --ff-only`）し、`/content/repo` に cd します。
+            `REPO_URL` を自分のリポジトリに向けて clone（2 回目以降は `git pull --ff-only`）し、`/content/repo` に cd します。
             `#@param` の `REPO_URL` だけ自分の GitHub URL に書き換えれば後はそのままで動きます。
 
-            HF トークンは**コードに直書きせず Colab Secrets の `HF_TOKEN`** から読みます。
-            右側のファイルパネルの 🔑（Secrets / パスワード）タブに `HF_TOKEN` という名前のシークレットを登録しておくと、
-            `userdata.get("HF_TOKEN")` で取り出して環境変数にセットします（ノートブック本体にトークンは残りません）。
+            ### token は「cell の #@param → kernel env → Colab Secrets」の順で探す
 
-            ### clone 後にアップロードするファイル（この cell の **後** で OK）
+            | 変数 | env 名 | Colab Secrets 名 | 無いとき |
+            | --- | --- | --- | --- |
+            | `KAGGLE_API_TOKEN` | `KAGGLE_API_TOKEN` / `KAGGLE_API_KEY` / `KAGGLE_ACCESS_TOKEN` | `KAGGLE_API_TOKEN` → `KAGGLE_API_KEY` | `data/tasks.jsonl` の download を skip（手元で置いた物を使う） |
+            | `KAGGLE_USERNAME` + `KAGGLE_KEY` | 同じ名前 | 同じ名前 | legacy key 経路は使わない |
+            | `HF_TOKEN` | `HF_TOKEN` | `HF_TOKEN` | cell 4 の gated model 読み込みが 401 になる |
+
+            - Colab の運用は Secrets が定番です（https://www.kaggle.com/settings/api の Create New Token を Secrets に入れる。
+              左の **Secrets** -> Notebook access ON を忘れると `NotebookAccessError`）。`.ipynb` に token が残りません
+            - **VS Code / Kaggle kernel では `google.colab` が無いので env 側**で動きます（`export KAGGLE_API_TOKEN=...`）。
+              環境変数の値は token 文字列でも、token を書いた **file の path** でも通します（`kaggle` CLI と同じ読み方 = `doc/colab.md` §9）
+            - 取れた token は `os.environ["KAGGLE_API_TOKEN"]` に戻し、おまけに `~/.kaggle/access_token`（mode 600）へも書きます。
+              Colab の `!export` は subprocess に残らないので、この 2 段どりで後続 cell の `kaggle` 呼び出しにも効きます
+            - legacy の `KAGGLE_USERNAME` + `KAGGLE_KEY` しかないときは `~/.kaggle/kaggle.json` を作ります
+            - **token の値は print しません**（出所と文字数だけ。`kaggle auth print-access-token` は実行しない）
+            - token が無いところで cell は落ちません（download を skip して案内を出すだけ。git や Files パネルで置く運用が生きています）
+
+            ### `data/tasks.jsonl` はこの cell が Kaggle から取りにいく
+
+            ```bash
+            kaggle competitions download -c gemma-4-developer-agent -f tasks.jsonl -p data
+            ```
+
+            zip で返ってきたときは Python の `zipfile` で `data/tasks.jsonl` に展開します（`unzip` の無い環境でも動くように）。
+            **既に `data/tasks.jsonl` がある場合は上書きしません**（`git pull` で入れた物 / Files パネルで置いた物をそのまま使う）。
 
             | パス | 中身 | 無い場合 |
             | --- | --- | --- |
-            | `data/tasks.jsonl` | gold patch / test patch 入りの評価タスク定義（JSONL） | gold 合成 SFT が作れず、cell 4 が空振りします |
-            | `results/` | eval kernel の出力（`kaggle kernels output <kernel> -p results/` で取得した JSON 一式） | cell 4 は gold 合成 SFT のみ、cell 5 の DPO は skip になります |
+            | `data/tasks.jsonl` | 評価タスク 129 個（`patch` = 正解 gold patch、`test_patch` / `problem_statement` 付き） | gold 合成 SFT が作れず cell 4 が空振りする |
+            | `results/` | eval kernel の出力（`kaggle kernels output <kernel> -p results/` で自分の kernel から取る） | cell 4 は gold 合成のみ、cell 5 の DPO は skip |
 
-            いずれもリポジトリ直下（`/content/repo/data/tasks.jsonl`、`/content/repo/results/`）に置きます。
-            ファイルパネルへのドラッグ&ドロップが一番手っ取り早く、`files.upload()` でも置けます。
-
-            ```python
-            from google.colab import files
-
-            files.upload()  # tasks.jsonl を /content にアップロード → !mv -f /content/tasks.jsonl data/tasks.jsonl
-            ```
+            `results/` は competition の file ではないので自動取得しません。eval kernel を Kaggle で回して、その出力を
+            手元で `kaggle kernels output <自分の kernel> -p results/` と下ろし、`/content/repo/results` に置いて `git pull` する（運用は今まで通り）。
             """
         ),
         _code(
             """
-            #@title 2. リポジトリの clone / 更新 & HF ログイン
+            #@title 2. リポジトリ clone / 更新 & Kaggle / HF 認証 + tasks.jsonl 取得
+            import json
             import os
+            import subprocess
+            import zipfile
             from pathlib import Path
 
-            REPO_URL = "https://github.com/<you>/gemma4-dev-agent.git"  #@param {type:"string"}
+            REPO_URL = "https://github.com/<you>/Gemma4_Developer-Agent-Competition_202611.git"  #@param {type:"string"}
+            KAGGLE_API_TOKEN = ""  #@param {type:"string"}
+            KAGGLE_USERNAME = ""  #@param {type:"string"}
+            KAGGLE_KEY = ""  #@param {type:"string"}
+            HF_TOKEN = ""  #@param {type:"string"}
             REPO_DIR = Path("/content/repo")
+            COMPETITION = "gemma-4-developer-agent"
+            TASKS = REPO_DIR / "data" / "tasks.jsonl"
+            KAGGLE_ENVS = ("KAGGLE_API_TOKEN", "KAGGLE_API_KEY", "KAGGLE_ACCESS_TOKEN")
+            KAGGLE_SECRETS = ("KAGGLE_API_TOKEN", "KAGGLE_API_KEY")
 
             if not (REPO_DIR / ".git").exists():
                 !git clone {REPO_URL} {REPO_DIR}
@@ -138,15 +169,105 @@ def build_notebook() -> nbf.NotebookNode:
 
             %cd {REPO_DIR}
 
-            # Gemma 4 重み取得用トークン（Colab Secrets の HF_TOKEN を推奨）
-            try:
-                from google.colab import userdata
-                hf_token = userdata.get("HF_TOKEN")
-                if hf_token:
-                    os.environ["HF_TOKEN"] = hf_token
-                    print("[auth] HF_TOKEN loaded from Colab Secrets")
-            except Exception:
-                pass
+
+            def resolve_token(cell_value, env_names, secret_names, quiet=False):
+                '''token を cell の #@param -> kernel env -> Colab Secrets の順で探す（doc/colab.md §9 §10）。
+
+                Colab の `!export` は subprocess に残らないので、取れたら caller が os.environ に戻す前提。
+                env の値は token 文字列でも「token を書いた file の path」でも通す（kaggle CLI と同じ作法）。
+                無いところで落とさない（token 無し運用 = 手元で data/tasks.jsonl を置く道を生かす）。
+                値は print せず長さと出所だけ出す。
+                '''
+                value = (cell_value or "").strip()
+                if value:
+                    print(f"[auth] cell の #@param で受け取った（{len(value)} chars）")
+                    return value
+                for name in env_names:
+                    raw = (os.environ.get(name) or "").strip()
+                    if not raw:
+                        continue
+                    if "/" in raw and Path(raw).expanduser().is_file():
+                        raw = Path(raw).expanduser().read_text(encoding="utf-8").strip()
+                        print(f"[auth] env {name} は file path なので中身を使う（{len(raw)} chars）")
+                    else:
+                        print(f"[auth] env {name} を使う（{len(raw)} chars）")
+                    return raw
+                try:
+                    from google.colab import userdata
+                except ImportError:                      # VS Code / Kaggle kernel では Secrets 自体が無い
+                    if not quiet:
+                        print(f"[auth] token 無し（cell / env {env_names[0]} が空、Colab 以外では Secrets 無し）")
+                    return ""
+                for name in secret_names:
+                    try:
+                        raw = (userdata.get(name) or "").strip()
+                    except Exception:                    # SecretNotFoundError / Secrets の Notebook access OFF
+                        raw = ""
+                    if raw:
+                        print(f"[auth] Colab Secrets の {name} を使う（{len(raw)} chars）")
+                        return raw
+                if not quiet:
+                    print(f"[auth] token 無し（cell / env {env_names[0]} / Secrets {secret_names[0]} が空）")
+                return ""
+
+
+            def run(cmd, tail=300):
+                '''kaggle CLI や unzip を回す（+ 行で実行内容、out は末尾だけ print、返し値は (code, out)）。'''
+                print("+ " + " ".join(str(part) for part in cmd), flush=True)
+                proc = subprocess.run([str(part) for part in cmd], capture_output=True, text=True)
+                out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+                if out:
+                    print(out[-tail:], flush=True)
+                return proc.returncode, out
+
+
+            kdir = Path.home() / ".kaggle"
+            kdir.mkdir(parents=True, exist_ok=True)
+            kaggle_token = resolve_token(KAGGLE_API_TOKEN, KAGGLE_ENVS, KAGGLE_SECRETS)
+            legacy_user = resolve_token(KAGGLE_USERNAME, ("KAGGLE_USERNAME",), ("KAGGLE_USERNAME",), quiet=True)
+            legacy_key = resolve_token(KAGGLE_KEY, ("KAGGLE_KEY",), ("KAGGLE_KEY",), quiet=True)
+
+            if kaggle_token:
+                os.environ["KAGGLE_API_TOKEN"] = kaggle_token            # 同じ kernel の subprocess 経由 CLI に効く
+                with (kdir / "access_token").open("w", encoding="utf-8") as fh:
+                    print(kaggle_token, file=fh)                         # 改行だけ付けて file に置く（doc §10）
+                os.chmod(kdir / "access_token", 0o600)
+                print(f"[auth] ~/.kaggle/access_token に設定（{len(kaggle_token)} chars、値は出さない）")
+            if not kaggle_token and legacy_user and legacy_key:
+                os.environ["KAGGLE_USERNAME"], os.environ["KAGGLE_KEY"] = legacy_user, legacy_key
+                (kdir / "kaggle.json").write_text(json.dumps({"username": legacy_user, "key": legacy_key}))
+                os.chmod(kdir / "kaggle.json", 0o600)
+                print(f"[auth] legacy key を ~/.kaggle/kaggle.json に設定（user: {legacy_user}）")
+
+            kaggle_ok = bool(kaggle_token or (legacy_user and legacy_key))
+            if not kaggle_ok:
+                print("[auth] Kaggle credential 無し -> tasks.jsonl の download は skip（手元から置けばそれで動く）")
+
+            hf_token = resolve_token(HF_TOKEN, ("HF_TOKEN",), ("HF_TOKEN",))
+            if hf_token:
+                os.environ["HF_TOKEN"] = hf_token
+                print("[auth] HF_TOKEN を kernel env に設定（cell 4 の gated model 読み込みに要る）")
+
+            if TASKS.is_file():
+                print(f"[tasks] 有り（download は skip）: {TASKS}（{TASKS.stat().st_size} bytes）")
+            elif kaggle_ok:
+                code, out = run(["kaggle", "competitions", "download", "-c", COMPETITION, "-f", "tasks.jsonl", "-p", "data"])
+                if code != 0 and any(word in out for word in ("401", "403", "404", "Forbidden", "Unauthorized")):
+                    print("[tasks] Kaggle が download を断った。規約同意（competitions/gemma-4-developer-agent）か token の有効性を確認")
+                for zipped in sorted((REPO_DIR / "data").glob("*.zip")):
+                    with zipfile.ZipFile(zipped) as zf:
+                        hits = [name for name in zf.namelist() if name.endswith("tasks.jsonl")]
+                        if hits:
+                            TASKS.write_bytes(zf.read(hits[0]))
+                            print(f"[tasks] zip から展開: {zipped} -> {TASKS}")
+                    zipped.unlink(missing_ok=True)
+            if TASKS.is_file():
+                rows = len(TASKS.read_text(encoding="utf-8").splitlines())
+                print(f"[tasks] OK: {TASKS}（{rows} 行）-> cell 4 の gold 合成 SFT に使う")
+            else:
+                print("[tasks] 無い。手元で: kaggle competitions download -c gemma-4-developer-agent -f tasks.jsonl -p data")
+                print("[tasks] か Files パネルで /content/repo/data/ に置く（無ければ cell 4 の gold 合成が空振り）")
+            print("[results]", "有り（cell 5 の DPO に使う）" if (REPO_DIR / "results").is_dir() else "無し（cell 5 は skip）")
             """
         ),
         _md(
@@ -156,8 +277,14 @@ def build_notebook() -> nbf.NotebookNode:
             **コードを書かずに学習設定を切り替えるフォーム cell** です。下の値を変えるだけで、cell 4 / 5 に渡す
             CLI 引数が組み立てられます。
 
-            - `ADAPTER_NAME` / `ROLE`: Multi-LoRA の作成対象。`main_lora`（`ROLE=main`）と `analyzer_lora`（`ROLE=analyzer`）を
-              それぞれこの notebook で 1 本ずつ作ります
+            - `ADAPTER_NAME` / `ROLE`: Multi-LoRA の作成対象。3 LoRA（`main_lora` / `analyzer_lora` / `verifier_lora`）を
+              それぞれ 1 本ずつこの notebook で作ります。`ADAPTER_NAME` と `ROLE` は必ず組み合わせ揃えます
+              （`main_lora`↔`main` / `analyzer_lora`↔`analyzer` / `verifier_lora`↔`verifier`）。
+              `ROLE` で system prompt（`submission/prompts/{system,analyzer,verifier}.md`）と教材データが決まります
+            - `TRAJECTORIES_JSONL` / `DPO_PAIRS`: role 単位の学習データパス。cell 3 の末尾で `ROLE` から自動計算する:
+              `data/trajectories.jsonl` / `data/trajectories_analyzer.jsonl` / `data/trajectories_verifier.jsonl` と
+              `data/dpo_pairs_main.jsonl` / `data/dpo_pairs_analyzer.jsonl` / `data/dpo_pairs_verifier.jsonl`
+              （main は従来の `data/trajectories.jsonl` のまま）
             - `R` / `ALPHA`: LoRA ランクとスケーリング。`ALPHA = 2 * R` 目安
             - `USE_RSLORA`: RSLoRA（`--use_rslora`）。高ランクでも勾配が潰れにくく、rank を変えても学習率を再調整しなくて済みます
             - `LORA_PLUS_RATIO`: LoRA+ の倍率（`--lora_plus_ratio`）。`lora_B` の学習率を上げてツール呼び出しの収束を早めます。1.0 で無効
@@ -172,8 +299,8 @@ def build_notebook() -> nbf.NotebookNode:
         _code(
             """
             #@title 3. 学習設定（Multi-LoRA / RSLoRA / LoRA+ / DPO）
-            ADAPTER_NAME = "main_lora"          #@param ["main_lora", "analyzer_lora"]
-            ROLE = "main"                       #@param ["main", "analyzer"]
+            ADAPTER_NAME = "main_lora"          #@param ["main_lora", "analyzer_lora", "verifier_lora"]
+            ROLE = "main"                       #@param ["main", "analyzer", "verifier"]
             R = 32                              #@param {type:"integer"}
             ALPHA = 64                          #@param {type:"integer"}
             USE_RSLORA = True                   #@param {type:"boolean"}
@@ -186,6 +313,11 @@ def build_notebook() -> nbf.NotebookNode:
             TASKS_JSONL = "data/tasks.jsonl"    #@param {type:"string"}
             RESULTS_DIR = "results"             #@param {type:"string"}
             OUT_DIR = f"submission/adapters/{ADAPTER_NAME}"
+
+            # role ごとに教材を分ける（main は従来の data/trajectories.jsonl のまま）
+            role_suffix = "" if ROLE == "main" else f"_{ROLE}"
+            TRAJECTORIES_JSONL = f"data/trajectories{role_suffix}.jsonl"
+            DPO_PAIRS = f"data/dpo_pairs_{ROLE}.jsonl"
 
             extra_lora_flags = []
             if USE_RSLORA:
@@ -202,10 +334,16 @@ def build_notebook() -> nbf.NotebookNode:
             """
             ## Cell 4 — Stage 1: `collect_trajectories.py` で RFT/SFT データ作成 → `train_lora.py` で LoRA 学習
 
-            1. `src/collect/collect_trajectories.py` が学習データ `data/trajectories.jsonl` を作ります。
+            1. `src/collect/collect_trajectories.py --role {ROLE}` が学習データを 1 本作ります。出力先は cell 3 の `TRAJECTORIES_JSONL`:
+               `main` → `data/trajectories.jsonl`、`analyzer` → `data/trajectories_analyzer.jsonl`、
+               `verifier` → `data/trajectories_verifier.jsonl`（role で別々にしておかないと、3 本目の学習で前の教材が上書きされます）。
+               `--role` で使う system prompt と教材の形が変わります:
+               `main` = edit_file → pytest → submit_patch、`analyzer` = read-only の局所化報告、`verifier` = 対象 test のみ実行して
+               `VERDICT: GO` の報告（analyzer / verifier は edit_file / write_file / submit_patch を教材にしない）。
                `results/` があるときだけ `--import-traces results --only-resolved` を付けて、**解けた（resolved=True）
                軌跡だけを RFT として import** し、足りない分は tasks.jsonl の gold patch から合成した SFT 軌跡で補います。
-            2. `src/train/train_lora.py` が cell 3 の設定（RSLoRA / LoRA+ / 4bit）で LoRA を学習し、`OUT_DIR` に保存します。
+            2. `src/train/train_lora.py` が cell 3 の設定（RSLoRA / LoRA+ / 4bit）で LoRA を学習し、`OUT_DIR`
+               （`submission/adapters/<ADAPTER_NAME>`）に保存します。
 
             試走させたいときは `collect_trajectories.py` に `--limit N`、`train_lora.py` に `--max_examples N` を足して
             件数を絞ってください（初回は tokenizer 読み込みだけで数分かかります）。
@@ -218,12 +356,14 @@ def build_notebook() -> nbf.NotebookNode:
 
             import_arg = f"--import-traces {RESULTS_DIR} --only-resolved" if Path(RESULTS_DIR).exists() else ""
             !python3 src/collect/collect_trajectories.py \\
+                --role {ROLE} \\
                 --tasks {TASKS_JSONL} \\
                 {import_arg} \\
-                --output data/trajectories.jsonl
+                --output {TRAJECTORIES_JSONL}
+            print("[stage1] training data:", TRAJECTORIES_JSONL, "-> adapter:", OUT_DIR)
 
             !python3 src/train/train_lora.py \\
-                --data data/trajectories.jsonl \\
+                --data {TRAJECTORIES_JSONL} \\
                 --out_dir {OUT_DIR} \\
                 --r {R} --alpha {ALPHA} \\
                 --epochs {SFT_EPOCHS} \\
@@ -234,7 +374,9 @@ def build_notebook() -> nbf.NotebookNode:
             """
             ## Cell 5 — Stage 2: `build_dpo_pairs.py` で選好ペア生成 → DPO 事後学習
 
-            1. `src/collect/build_dpo_pairs.py` が eval 軌跡から `prompt` / `chosen` / `rejected` の選好ペアを作ります。
+            1. `src/collect/build_dpo_pairs.py --role {ROLE}` が eval 軌跡から `prompt` / `chosen` / `rejected` の選好ペアを作ります。
+               出力は cell 3 の `DPO_PAIRS`（= `data/dpo_pairs_{ROLE}.jsonl`）で、Stage 1 と同じ role のペアだけを使います
+               （analyzer / verifier のペアに main の edit_file 軌跡が混ざることはない）。
                chosen は `resolved=True` の軌跡（無ければ tasks.jsonl から gold 合成）、rejected は同じ task の
                解決できなかった軌跡（テスト失敗・ERROR/TIMEOUT・NO_PATCH・過剰ターン打ち切り）です。1 task あたり
                `--max-pairs-per-task`（既定 2）まで。
@@ -284,7 +426,8 @@ def build_notebook() -> nbf.NotebookNode:
             agent YAML の model・thinking・max_output_tokens / 単一モデルルール / adapter 名と `adapter_config.json`）。
             続けて `ls -lh {OUT_DIR}` で `OUT_DIR` の中身（adapter ファイル）を表示します。
 
-            Colab のディスクは消えるので、`submission/`（`adapters/main_lora` または `adapters/analyzer_lora` 含む）を
+            Colab のディスクは消えるので、`submission/`（`adapters/main_lora` / `adapters/analyzer_lora` /
+            `adapters/verifier_lora` の adapter ファイル含む）を
             zip にしてダウンロードし、ローカル側で最終的な `submission.zip` をビルドしてください。
             """
         ),

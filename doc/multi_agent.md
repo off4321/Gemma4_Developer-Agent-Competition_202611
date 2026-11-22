@@ -49,18 +49,23 @@ graph 系 tool を **子だけ**に宣言すると、prompt には説明が出�
 agent.yaml  (LlmAgent, main_lora 相当)
  ├─ tools: run_command, get_status, submit_patch, read_file, edit_file, write_file,
  │         get_code_neighbors, search_similar_code, get_code_subgraph   ← 全部宣言
- └─ agent_tool: sub_agents/code_analyzer.yaml (skip_summarization: true)
-        tools: read_file, run_command, search_similar_code, get_code_neighbors, get_code_subgraph
-              ← 編集系（edit_file/write_file/submit_patch）を持たせない
+ ├─ agent_tool: sub_agents/code_analyzer.yaml (skip_summarization: true)
+ │      tools: read_file, run_command, search_similar_code, get_code_neighbors, get_code_subgraph
+ │            ← 編集系（edit_file/write_file/submit_patch）を持たせない
+ └─ agent_tool: sub_agents/verifier.yaml (skip_summarization: true)
+        tools: run_command, read_file, get_status   ← 検査専用。宣言済みだが未接続
+        （`adapters/verifier_lora` が出来るまで agent.yaml 側はコメントアウト。接続すると
+          `build_submission.py` が walk して model 種類の検査も行う）
 ```
 
-追加で効きうる 2 枚（`doc/tasks.md` T6）:
+verifier の学習データは `python3 src/collect/collect_trajectories.py --role verifier` で
+`data/trajectories_verifier.jsonl` に合成する（`--role analyzer` は analyzer 用の read-only 局所化）。
+verifier に `edit_file` / `submit_patch` を呼ぶデータが混ざると幻覚 tool call の教師になるので、
+collector は `check_role_calls()` でビルド時に弾く。
 
-1. **verifier（検査専用 agent_tool）**
-   - tools: `run_command`, `read_file`, `get_status` のみ。`edit_file`/`submit_patch` 無し。
-   - 役: 「この diff に対して `pytest <target> -q --tb=short` を実行し、失敗理由を 1 行、
-     追加で読むべき行番号を列挙して返す」。親は edit を繰り返すだけになります。
-2. **critic（patch 衛生チェック）**
+残り 1 枚（`doc/tasks.md` T6）:
+
+1. **critic（patch 衛生チェック）**
    - tools: `run_command`（`git diff`, `git status`）+ `read_file` のみ。
    - 役: 提出前に `/workspace` に scratch が残っていないか、保護ファイルを触っていないか、
      hunks が妥当かを確認して YES/NO を返す。NO なら親が掃除してから `submit_patch`。

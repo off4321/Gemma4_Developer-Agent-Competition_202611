@@ -24,4 +24,9 @@ tools:
   - agent_tool:
       config_path: sub_agents/code_analyzer.yaml
       skip_summarization: true
+  # keep commented out until adapters/verifier_lora/ exists: sub_agents/verifier.yaml is only
+  # reachable (and its model counted) once this entry is live -> HARNESS_README §2.3
+  # - agent_tool:
+  #     config_path: sub_agents/verifier.yaml
+  #     skip_summarization: true
 generate_content_config: !include configs/sampling.yaml

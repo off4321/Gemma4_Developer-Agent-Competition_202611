@@ -6,9 +6,14 @@ Two pairing sources are supported so DPO works even when 4B solves few tasks at 
   2. Gold-fallback pairs (--tasks): when no resolved trace exists for a task, pair the gold-patch
      synthetic trajectory (chosen) against a failed/looping/NO_PATCH trace (rejected).
 
-Role filtering (--role main | analyzer) supports Multi-LoRA:
+Role filtering (--role main | analyzer | verifier) supports Multi-LoRA:
   - main     : full coding/editing/testing/submit_patch trajectories (default)
   - analyzer : read-only exploration + root-cause report trajectories (no edit_file/submit_patch)
+  - verifier : run the targeted tests and report VERDICT (no edit_file / submit_patch)
+
+The gold fallback (`--tasks`) works for every role: `build_trajectory(..., role=...)` synthesizes
+the matching chosen-side trajectory, with `submission/prompts/{system,analyzer,verifier}.md` as the
+system prompt of that role.
 """
 
 from __future__ import annotations
@@ -21,9 +26,15 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from collect.collect_trajectories import build_trajectory, normalize_trace  # noqa: E402
+from collect.collect_trajectories import (  # noqa: E402
+    build_trajectory,
+    normalize_trace,
+    resolve_system_prompt,
+)
 
 ANALYZER_TOOLS = {"read_file", "run_command", "search_similar_code", "get_code_neighbors", "get_code_subgraph"}
+VERIFIER_TOOLS = {"run_command", "read_file", "get_status"}
+ROLE_TOOLS: dict[str, set[str]] = {"analyzer": ANALYZER_TOOLS, "verifier": VERIFIER_TOOLS}
 DEFAULT_BUDGET = {"max_tool_calls": 80, "max_turns": 150, "max_time_minutes": 45.0}
 
 
@@ -35,13 +46,15 @@ def _task_key(path: Path, traj: dict[str, Any]) -> str:
 def _matches_role(messages: list[dict[str, Any]], role: str) -> bool:
     if role == "main":
         return True
+    allowed = ROLE_TOOLS[role]
     tool_names = {
         tc.get("function", {}).get("name")
         for m in messages
         for tc in (m.get("tool_calls") or [])
     }
-    # Analyzer should only use read-only exploration tools (never edit_file / submit_patch).
-    return bool(tool_names) and tool_names.issubset(ANALYZER_TOOLS)
+    # analyzer / verifier must stay inside their own tool set: a trace that edited files or
+    # called submit_patch belongs to the main agent, never to these sub-agents.
+    return bool(tool_names) and tool_names.issubset(allowed)
 
 
 def _split_prompt_and_response(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -73,16 +86,19 @@ def _load_traces(results_dirs: list[Path], role: str) -> dict[str, dict[str, lis
     return grouped
 
 
-def _load_gold_trajectories(tasks_path: Path, system_prompt_path: Path, role: str) -> dict[str, dict[str, Any]]:
-    if role == "analyzer" or not tasks_path.is_file() or not system_prompt_path.is_file():
+def _load_gold_trajectories(tasks_path: Path, role: str, system_prompt: str | None = None,
+                            ) -> dict[str, dict[str, Any]]:
+    """tasks.jsonl から role 用の gold chosen を作る（analyzer / verifier も編集はしない）."""
+    if not tasks_path.is_file():
         return {}
-    sys_prompt = system_prompt_path.read_text(encoding="utf-8")
+    sys_prompt, _ = resolve_system_prompt(role, system_prompt)
     gold: dict[str, dict[str, Any]] = {}
     for line in tasks_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         task = json.loads(line)
-        traj = build_trajectory(task, sys_prompt, DEFAULT_BUDGET, native_tools=True, max_edits=6, max_hunk_lines=80)
+        traj = build_trajectory(task, sys_prompt, DEFAULT_BUDGET, native_tools=True, max_edits=6,
+                                max_hunk_lines=80, role=role)
         if traj:
             gold[str(task["instance_id"])] = traj
     return gold
@@ -125,17 +141,21 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Build DPO preference pairs from eval traces")
     p.add_argument("--results", nargs="+", required=True, help="one or more results/ or traces/ directories")
     p.add_argument("--tasks", default="data/tasks.jsonl", help="optional tasks.jsonl for gold-fallback chosen")
-    p.add_argument("--system-prompt", default="submission/prompts/system.md")
-    p.add_argument("--role", choices=["main", "analyzer"], default="main")
+    p.add_argument("--system-prompt", default=None,
+                   help="override the system prompt used for the gold fallback (default: per --role)")
+    p.add_argument("--role", choices=["main", "analyzer", "verifier"], default="main")
     p.add_argument("--max-pairs-per-task", type=int, default=2)
-    p.add_argument("--output", default="data/dpo_pairs.jsonl")
+    p.add_argument("--output", default=None,
+                   help="output jsonl (default: data/dpo_pairs.jsonl, data/dpo_pairs_<role>.jsonl "
+                        "for analyzer / verifier)")
     args = p.parse_args()
 
     grouped = _load_traces([Path(r) for r in args.results], args.role)
-    gold = _load_gold_trajectories(Path(args.tasks), Path(args.system_prompt), args.role)
+    gold = _load_gold_trajectories(Path(args.tasks), args.role, args.system_prompt)
     pairs = build_pairs(grouped, gold, max_pairs_per_task=args.max_pairs_per_task)
 
-    out = Path(args.output)
+    default_output = "data/dpo_pairs.jsonl" if args.role == "main" else f"data/dpo_pairs_{args.role}.jsonl"
+    out = Path(args.output or default_output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as fh:
         for row in pairs:

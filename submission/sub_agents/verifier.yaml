@@ -1,0 +1,21 @@
+# Verification-only sub-agent (AgentTool, skip_summarization: true).
+# NOTE: `model` here must be IDENTICAL to the root agent model — swegemma's
+# validate_single_model_rule() counts every declared model across agent.yaml and every
+# sub_agents/*.yaml it can reach and fails the server startup if it sees 2 different models
+# (HARNESS_README §2.3 / §2.5).
+name: verifier
+description: >-
+  Verifies the parent's pending patch by running the targeted tests (never a bare `pytest`)
+  and returns a fixed machine-readable report: VERDICT / PENDING_TESTS / FAILURE_SUMMARY /
+  FILES_CHANGED / CONFIDENCE / NEXT_ACTION. It never edits files and never calls submit_patch.
+tools:
+  - run_command
+  - read_file
+  - get_status
+model: gemma-4-e4b-it-qat-w4a16-ct
+# adapter: verifier_lora                    # uncomment only after adapters/verifier_lora/ exists
+instruction: !include ../prompts/verifier.md
+# ADK `generate_config` (max_tokens / max_thoughts) is NOT accepted here: this harness wants
+# `generate_content_config` with `max_output_tokens: 1024` and
+# `thinking_config.thinking_budget: 512` -> see configs/verifier_sampling.yaml.
+generate_content_config: !include ../configs/verifier_sampling.yaml
