@@ -133,22 +133,45 @@ def load_examples(path: str, max_examples: int) -> list[Conversation]:
     return conversations
 
 
+def _normalize_tool_calls(message: Message) -> Message:
+    """Deserialize string `function.arguments` into dicts for Gemma 4's Jinja chat_template."""
+    calls = message.get("tool_calls")
+    if not calls:
+        return message
+    normalized = []
+    for call in calls:
+        fn = call.get("function") or {}
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args or "{}")
+            except json.JSONDecodeError:
+                parsed = {}
+            fn = {**fn, "arguments": parsed if isinstance(parsed, dict) else {"raw": parsed}}
+            call = {**call, "function": fn}
+        normalized.append(call)
+    return {**message, "tool_calls": normalized}
+
+
 def render_message(tokenizer: AutoTokenizer, message: Message) -> str:
     """Render one turn with the model's chat template.
 
     Falls back to embedding the tool call as text when the installed template does not
     serialize `tool_calls` (checked once per assistant turn).
     """
-    text = tokenizer.apply_chat_template([message], add_generation_prompt=False, tokenize=False)
-    calls = message.get("tool_calls") or []
-    if not calls or message.get("role") not in ASSISTANT_ROLES:
+    msg = _normalize_tool_calls(message)
+    text = tokenizer.apply_chat_template([msg], add_generation_prompt=False, tokenize=False)
+    calls = msg.get("tool_calls") or []
+    if not calls or msg.get("role") not in ASSISTANT_ROLES:
         return text
     names = [c.get("function", {}).get("name", "") for c in calls]
     if any(name and name in text for name in names):
         return text  # the template already serialised the call
-    payload = [{"name": c.get("function", {}).get("name"),
-                "arguments": json.loads(c.get("function", {}).get("arguments", "{}") or "{}")}
-               for c in calls]
+    payload = [
+        {"name": c.get("function", {}).get("name"),
+         "arguments": c.get("function", {}).get("arguments") or {}}
+        for c in calls
+    ]
     return text + "<tool_call>\n" + json.dumps(payload, ensure_ascii=False) + "\n</tool_call>\n"
 
 
