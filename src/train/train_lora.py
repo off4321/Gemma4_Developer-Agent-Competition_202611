@@ -259,12 +259,13 @@ def quantization_config():
 
 
 def prepare_for_kbit_training(model):
-    """Freeze the 4-bit base and recompute activations instead of caching them."""
-    try:
-        from peft.utils import prepare_model_for_kbit_training
-    except ImportError:  # older peft
-        from peft.utils.other import prepare_model_for_kbit_training
-    return prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    """Freeze the 4-bit base and enable gradient checkpointing without fp32-upcasting 262k-vocab lm_head."""
+    for param in model.parameters():
+        param.requires_grad = False
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+    model.config.use_cache = False
+    return model
 
 
 def load_base(args: argparse.Namespace, model_path: str):
@@ -272,8 +273,9 @@ def load_base(args: argparse.Namespace, model_path: str):
     kwargs: dict[str, Any] = {"trust_remote_code": True}
     if args.use_4bit and torch.cuda.is_available():
         kwargs["quantization_config"] = quantization_config()
+        kwargs["torch_dtype"] = auto_dtype()
         kwargs["device_map"] = "auto"
-        print("[model] QLoRA: 4-bit NF4 base weights")
+        print(f"[model] QLoRA: 4-bit NF4 base weights (non-quantized={kwargs['torch_dtype']})")
     else:
         kwargs["torch_dtype"] = auto_dtype() if args.dtype == "auto" else DTYPES[args.dtype]
         print(f"[model] torch_dtype={kwargs['torch_dtype']} (T4 x2 has no bf16 matmul support -> float16 there)")
