@@ -285,6 +285,7 @@ def load_base(args: argparse.Namespace, model_path: str):
         model = prepare_for_kbit_training(model)
     else:
         model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
         model.config.use_cache = False
     return model
 
@@ -351,6 +352,7 @@ def training_step(model, example: Example, index: int, device: torch.device,
         loss = model(**batch).loss
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
         print(f"[warn] OOM at sample {index} (len={len(example['input_ids'])}), skipping")
         return None
     (loss / args.grad_accum).backward()
