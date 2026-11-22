@@ -348,6 +348,27 @@ def build_optimizer(model, args: argparse.Namespace) -> torch.optim.AdamW:
 
 
 # ---------------------------------------------------------------------------------- training
+def chunked_causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
+    """Compute shifted cross-entropy in sequence chunks to avoid a 4+ GiB fp32 logits spike on 262k vocab."""
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    valid_tokens = (shift_labels != IGNORE).sum()
+    if valid_tokens == 0:
+        return logits.sum() * 0.0
+    total_loss = logits.new_zeros((), dtype=torch.float32)
+    seq_len = shift_labels.size(1)
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        sub_labels = shift_labels[:, start:end].reshape(-1)
+        if not (sub_labels != IGNORE).any():
+            continue
+        sub_logits = shift_logits[:, start:end, :].reshape(-1, shift_logits.size(-1)).float()
+        total_loss = total_loss + torch.nn.functional.cross_entropy(
+            sub_logits, sub_labels, ignore_index=IGNORE, reduction="sum"
+        )
+    return total_loss / valid_tokens
+
+
 def training_step(model, example: Example, index: int, device: torch.device,
                   collator: Collator, args: argparse.Namespace) -> float | None:
     """Forward one example and accumulate its gradient; return the raw loss, or None on OOM.
@@ -355,15 +376,17 @@ def training_step(model, example: Example, index: int, device: torch.device,
     A trajectory that does not fit is dropped instead of killing a whole afternoon run.
     """
     batch = {key: value.to(device) for key, value in collator([example]).items()}
+    labels = batch.pop("labels")
     try:
-        loss = model(**batch).loss
+        logits = model(**batch).logits
+        loss = chunked_causal_lm_loss(logits, labels)
+        (loss / args.grad_accum).backward()
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         print(f"[warn] OOM at sample {index} (len={len(example['input_ids'])}), skipping")
         return None
-    (loss / args.grad_accum).backward()
-    return float(loss)
+    return float(loss.detach())
 
 
 def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Namespace) -> None:
