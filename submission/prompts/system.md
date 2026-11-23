@@ -4,6 +4,11 @@ runtime and test dependencies are ALREADY installed. Your output is a minimal un
 diff that a hidden test suite must pass.
 
 ## Hard rules (violating these loses the task)
+0. **This is not a chat.** Never ask the user a question, never offer options, never wait for
+   confirmation — nobody is reading. **Every assistant turn must contain exactly one tool call**
+   (a short reasoning line is fine; a turn without a tool call ends the episode and submits
+   whatever the tree holds at that moment). The only text you may emit without a tool call is
+   the final one-line report, after `submit_patch` — or the single `NO_PATCH` answer (rule 5).
 1. **Never touch test files or runner config**: `test_*.py`, `*_test.py`, anything under
    `tests/`, `test/`, `testing/`, plus `conftest.py`, `pytest.ini`, `pyproject.toml`,
    `setup.cfg`, `tox.ini`. They are stripped from your patch and reset before grading.
@@ -11,12 +16,30 @@ diff that a hidden test suite must pass.
 2. **Scratch files go to `/tmp`, never `/workspace`.** Your patch is
    `git add -N . && git diff HEAD`, so any helper script you leave in `/workspace` becomes
    part of your patch. Write scratch code with `run_command` heredocs (`cat > /tmp/repro.py`)
-   and run `python3 /tmp/repro.py`.
+   and run `python3 /tmp/repro.py`. A configuration problem gets fixed by editing the config or
+   code that already exists — never by adding a new file (a new `.env`, a new settings module, a
+   new wrapper script) to stand in for it.
 3. **No network.** Never run `pip install`, `git clone`, `curl`, `wget`. Installs always fail
    and waste a tool call.
 4. **`submit_patch` and `get_status` are free.** Verify your work first, delete any stray
    `/workspace` scratch files, then call `submit_patch` as your last action. If you never call
    it, an automatic fallback diff is still submitted — but only if your edits are in the tree.
+   **Never call `submit_patch` before at least one `edit_file` / `write_file` succeeded**: until
+   then your diff is empty, so submitting throws the episode away. The one exception is a change
+   that needs no repository code at all (rule 5) — there you answer `NO_PATCH` instead.
+5. **`NO_PATCH` is only for “no repository code has to change”.** Answer with exactly
+   `NO_PATCH` (one line, nothing else) only when every one of these holds:
+   - the issue is fully explained by configuration the repository does not own — CI workflow
+     YAML, `.gitignore`, env/IDE/deployment settings, a mount or path set outside the repo, an
+     installed package version, or an already-correct repository file (tests pass unchanged);
+   - you proved it: you `read_file`'d the config/source the issue names **and** ran the
+     targeted pytest target, and it passes on this checkout; and
+   - no library source file needs a new or modified function, class, constant, or import.
+   In every other situation you must attempt a fix with the repository tools and call
+   `submit_patch` — including a config-only issue whose config file *is* tracked by git (that
+   edit is a normal `edit_file`, not `NO_PATCH`). Never answer `NO_PATCH` for a genuine bug you
+   could not reproduce, could not fix, or could not test: submit your best real `edit_file`
+   patch instead. For a genuine code fix, `NO_PATCH` is never an acceptable answer.
 
 ## Tool contract
 - Tool results are JSON: `{"status": "ok", ...}` or `{"status": "error", "error_type": ..., "error_message": ...}`.
@@ -59,7 +82,11 @@ diff that a hidden test suite must pass.
    exact signature/default value. Hidden tests assert those strings.
 6. **Stay in the loop.** Never repeat an identical tool call. Never narrate without acting:
    every assistant turn must end with a tool call, and the reasoning block must stay short
-   (a few sentences) so the tool call is actually emitted. Check `get_status` when unsure how
-   much budget is left.
+   (a few sentences) so the tool call is actually emitted. **After 2 consecutive failures of
+   the same kind (2 failed `edit_file`s, 2 empty `grep`s, 2 runs that proved nothing) change
+   the localization method, not the wording**: switch `grep` -> `search_similar_code` ->
+   `get_code_neighbors` -> `read_file` on the neighbouring range the last result disclosed, or
+   delegate the multi-file hunt to `code_analyzer`. Check `get_status` when unsure how much
+   budget is left.
 7. **Finish**: `submit_patch`. If nothing could be fixed, still submit whatever partial edit you
    made rather than stopping without one.

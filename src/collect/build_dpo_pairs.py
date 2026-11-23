@@ -27,6 +27,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collect.collect_trajectories import (  # noqa: E402
+    DEFAULT_MAX_HUNK_LINES,
+    _load_tool_names,
     build_trajectory,
     normalize_trace,
     resolve_system_prompt,
@@ -35,7 +37,12 @@ from collect.collect_trajectories import (  # noqa: E402
 ANALYZER_TOOLS = {"read_file", "run_command", "search_similar_code", "get_code_neighbors", "get_code_subgraph"}
 VERIFIER_TOOLS = {"run_command", "read_file", "get_status"}
 ROLE_TOOLS: dict[str, set[str]] = {"analyzer": ANALYZER_TOOLS, "verifier": VERIFIER_TOOLS}
-DEFAULT_BUDGET = {"max_tool_calls": 80, "max_turns": 150, "max_time_minutes": 45.0}
+# DEFAULT_BUDGET は submission/eval_config.yaml と揃える（教材 user prompt に書き写す値なので
+# 80/150 の旧既定は使わない）。
+DEFAULT_BUDGET = {"max_tool_calls": 45, "max_turns": 60, "max_time_minutes": 45.0}
+# loop 認定: 同じ (tool, args) をこれだけ繰り返す/错误を繰り返す trace は「進まない agent」の rejected にする。
+LOOP_MIN_REPEAT_CALLS = 3
+LOOP_MIN_FAILED_STEPS = 4
 
 
 def _task_key(path: Path, traj: dict[str, Any]) -> str:
@@ -43,26 +50,124 @@ def _task_key(path: Path, traj: dict[str, Any]) -> str:
     return iid.removeprefix("trace_")
 
 
-def _matches_role(messages: list[dict[str, Any]], role: str) -> bool:
+def _role_matches(result: dict[str, Any] | list[dict[str, Any]], role: str) -> bool:
+    """Trajectory-level tool filter: `main` takes everything, sub-agents only their own tool set.
+
+    `result` is a normalized trace (`{"messages": [...]}`), a bare message list, or raw trace steps,
+    so ATIF traces are matched by the same code as ChatML ones. The check spans the whole
+    trajectory: the closing report turn of an analyzer / verifier carries no tool call at all, so a
+    per-message check would drop the answer we want to train on.
+    """
     if role == "main":
         return True
-    allowed = ROLE_TOOLS[role]
-    tool_names = {
-        tc.get("function", {}).get("name")
-        for m in messages
-        for tc in (m.get("tool_calls") or [])
-    }
+    messages = result.get("messages", result) if isinstance(result, dict) else result
+    tool_names = _load_tool_names(messages)
     # analyzer / verifier must stay inside their own tool set: a trace that edited files or
     # called submit_patch belongs to the main agent, never to these sub-agents.
-    return bool(tool_names) and tool_names.issubset(allowed)
+    return bool(tool_names) and set(tool_names) <= ROLE_TOOLS[role]
+
+
+def _matches_role(messages: list[dict[str, Any]], role: str) -> bool:
+    """Messages-level wrapper, kept for callers that already unpacked `messages`."""
+    return _role_matches({"messages": messages}, role)
 
 
 def _split_prompt_and_response(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split conversation into (prompt=[system, user], completion=[assistant/tool turns...])."""
+    """Split conversation into (prompt=[system, user], completion=[assistant/tool turns...]).
+
+    assistant / tool メッセージは `tool_calls` / `tool_call_id` / `name` をそのまま残す（train_lora.py
+    が supervised なしに読む必須項目なので、ここで落とすと DPO が tool 呼び出しを学べない）。
+    """
     for idx, msg in enumerate(messages):
         if msg.get("role") == "assistant":
             return messages[:idx], messages[idx:]
     return messages[:2], messages[2:]
+
+
+def _call_signature(call: dict[str, Any]) -> str:
+    """assistant の tool_call 1 件を「同じ呼び出し」判定用のシグネチャにする。"""
+    fn = call.get("function") or {}
+    name = str(fn.get("name") or call.get("name") or "")
+    args = fn.get("arguments", call.get("arguments"))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return f"{name}({args.strip()[:200]})"
+    return f"{name}({json.dumps(args, sort_keys=True, ensure_ascii=False)[:200]})"
+
+
+def _response_signals(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """1つの completion（assistant/tool の並び）から loop / 失敗の信号を抽出する。
+
+    messages に tool 応答が混在する形式（`role="tool"` + `tool_call_id`）でも、assistant メッセージ
+    内に call と result が同居する形式でも動く。observation を入力の 1 つとして loop を認定する
+    ので、tool 応答が無いと偽の loop は認定できない。
+    """
+    signatures: list[str] = []
+    failures = 0
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            signatures.append(_call_signature(call))
+        content = message.get("content")
+        if isinstance(content, str):
+            lowered = content.lower()
+            if message.get("role") in ("tool", "user") and (
+                    '"status": "error"' in lowered or "traceback" in lowered or "error" in lowered):
+                failures += 1
+        if isinstance(message.get("observations"), list):
+            for obs in message["observations"]:
+                if str(obs.get("outcome", "")).lower() in ("fail", "error", "failure"):
+                    failures += 1
+    repeated = {}
+    for signature in signatures:
+        repeated[signature] = repeated.get(signature, 0) + 1
+    worst_name, worst_count = "", 0
+    for signature, count in repeated.items():
+        if count > worst_count:
+            worst_name, worst_count = signature.split("(", 1)[0], count
+    edit_repeats = max([c for s, c in repeated.items() if s.startswith(("edit_file", "write_file"))] or [0])
+    return {
+        "tool_calls": len(signatures),
+        "repeated_calls": worst_count,
+        "repeated_tool": worst_name,
+        "edit_file_repeats": edit_repeats,
+        "failed_steps": failures,
+    }
+
+
+def _rejection_reason(trace: dict[str, Any], signals: dict[str, Any]) -> str | None:
+    """この trace を rejected に使っていい理由。None なら「失敗の証拠が無い」ので pair にしない。"""
+    resolved = trace.get("meta", {}).get("resolved")
+    if resolved is True:
+        return None
+    if signals["repeated_calls"] >= LOOP_MIN_REPEAT_CALLS:
+        return "repeat_loop"
+    if signals["edit_file_repeats"] >= 2:
+        return "edit_file_repeat"
+    if signals["failed_steps"] >= LOOP_MIN_FAILED_STEPS:
+        return "error_storm"
+    if resolved is False:
+        return "unresolved"
+    return None
+
+
+def _last_assistant_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str):
+            return message["content"].strip()
+    return ""
+
+
+def _ends_with_no_patch(messages: list[dict[str, Any]]) -> bool:
+    return _last_assistant_text(messages) == "NO_PATCH"
+
+
+def _requires_code_change(messages: list[dict[str, Any]]) -> bool:
+    """chosen 側が edit_file / write_file を 1 回でも含めば「本当に code 変更が要る task」。"""
+    return any(str((call.get("function") or {}).get("name") or call.get("name") or "").startswith(("edit_", "write_"))
+               for message in messages for call in message.get("tool_calls") or [])
+
 
 
 def _score_trace(traj: dict[str, Any]) -> tuple[int, int]:
@@ -79,7 +184,7 @@ def _load_traces(results_dirs: list[Path], role: str) -> dict[str, dict[str, lis
         files = sorted(root.rglob("trace_*.json")) or sorted(root.rglob("*.json"))
         for path in files:
             traj = normalize_trace(path)
-            if not traj or not _matches_role(traj["messages"], role):
+            if not traj or not _role_matches(traj, role):
                 continue
             bucket = "ok" if traj["meta"].get("resolved") is True else "fail"
             grouped[_task_key(path, traj)][bucket].append(traj)
@@ -98,7 +203,7 @@ def _load_gold_trajectories(tasks_path: Path, role: str, system_prompt: str | No
             continue
         task = json.loads(line)
         traj = build_trajectory(task, sys_prompt, DEFAULT_BUDGET, native_tools=True, max_edits=6,
-                                max_hunk_lines=80, role=role)
+                                max_hunk_lines=DEFAULT_MAX_HUNK_LINES, role=role)
         if traj:
             gold[str(task["instance_id"])] = traj
     return gold
@@ -111,8 +216,15 @@ def build_pairs(
 ) -> list[dict[str, Any]]:
     pairs: list[dict[str, Any]] = []
     for task_id, buckets in sorted(grouped.items()):
-        failed = sorted(buckets["fail"], key=lambda t: len(t["messages"]), reverse=True)
-        if not failed:
+        # rejected 候補は「失敗の証拠」がある trace だけ（signals が無い trace は pair にしない）。
+        scored = []
+        for trace in buckets["fail"]:
+            signals = _response_signals(trace["messages"])
+            reason = _rejection_reason(trace, signals)
+            if reason:
+                scored.append((signals["repeated_calls"], signals["failed_steps"], reason, trace, signals))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        if not scored:
             continue
         chosen_pool = sorted(buckets["ok"], key=_score_trace, reverse=True)
         source = "self_play"
@@ -124,15 +236,27 @@ def build_pairs(
 
         chosen_traj = chosen_pool[0]
         prompt, chosen_resp = _split_prompt_and_response(chosen_traj["messages"])
-        for rej_traj in failed[:max_pairs_per_task]:
+        if not chosen_resp:
+            continue
+        chosen_has_action = _requires_code_change(chosen_resp)
+        for _, _, reason, rej_traj, signals in scored[:max_pairs_per_task]:
             _, rejected_resp = _split_prompt_and_response(rej_traj["messages"])
-            if not chosen_resp or not rejected_resp:
+            # rejected は assistant で終わらせる。末尾が tool 応答なら、その観測を待たずにやめた
+            # 地点より後の tool 応答を落として使う（後半は学習対象にしない、という意味づけ）。
+            while rejected_resp and rejected_resp[-1].get("role") != "assistant":
+                rejected_resp = rejected_resp[:-1]
+            if not rejected_resp:
                 continue
+            if _ends_with_no_patch(rejected_resp) and not chosen_has_action:
+                # NO_PATCH が正解だった task に「NO_PATCH は悪い」と教える pair は作らない。
+                continue
+            if _last_assistant_text(chosen_resp) and _last_assistant_text(chosen_resp) == _last_assistant_text(rejected_resp):
+                continue  # 最后の応答が同一なら preference を教える対象が無い
             pairs.append({
                 "prompt": prompt,
                 "chosen": chosen_resp,
                 "rejected": rejected_resp,
-                "meta": {"instance_id": task_id, "source": source},
+                "meta": {"instance_id": task_id, "source": source, "rejection_reason": reason, **signals},
             })
     return pairs
 
@@ -162,8 +286,12 @@ def main() -> int:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     self_play = sum(1 for r in pairs if r["meta"]["source"] == "self_play")
+    reasons: dict[str, int] = defaultdict(int)
+    for row in pairs:
+        reasons[str(row["meta"].get("rejection_reason"))] += 1
     print(f"[dpo-data] role={args.role} tasks_with_traces={len(grouped)} pairs={len(pairs)} "
           f"(self_play={self_play}, gold_fallback={len(pairs) - self_play}) -> {out}")
+    print("[dpo-data] rejection_reason:", dict(reasons) or "{}")
     return 0
 
 

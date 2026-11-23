@@ -1,10 +1,14 @@
 # Per-task operational budgets, read by scripts/inference.py via `load_submission_eval_config`
 # ONLY when this file is at the ROOT of submission.zip and wrapped in `evaluation:`.
 # Defaults on the scorer: max_time_minutes=60, max_tool_calls=100, max_turns=500,
-# command timeout 300s, verification timeout 300s (fixed).
-# Container A is 4 GiB RAM / 2 vCPU and air-gapped: long test suites are the usual killer.
+# command timeout 300s, verification timeout 300s (fixed) -> the budgets below are deliberate.
+# Container A is 4 GiB RAM / 2 vCPU and air-gapped: long test suites are the usual killer, so the
+# agent must localize + patch + verify with few, targeted calls instead of exploring for a minute.
+# The 128k context (see configs/sampling.yaml) is what makes 60 turns affordable: 150 was wasted
+# (the loop stalls on its own mistakes long before that), 30 stalls before submit_patch, and
+# `build_submission.py` warns below max_turns=50 / max_tool_calls=40.
 evaluation:
   timeout_seconds: 300          # per-command timeout (Phase 1)
-  max_tool_calls: 80            # >= 40 recommended; submit_patch/get_status are FREE
+  max_tool_calls: 45            # read (1-2) + edit + pytest (1-3) + submit_patch + retries, still nowhere near 100
   max_time_minutes: 45          # agent-loop wall clock only (container setup excluded)
-  max_turns: 150                # 20 is too small: turn cap + 3 nudges terminates before submit_patch
+  max_turns: 60                 # room for 3 nudges + a pytest retry after a multi-file fix

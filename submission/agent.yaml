@@ -4,7 +4,7 @@
 # ============================================================================
 name: gemma_e4b_developer_agent
 model: gemma-4-e4b-it-qat-w4a16-ct          # must be one of ALLOWED_MODEL_NAMES
-adapter: main_lora                         # uncomment only after adapters/main_lora/ exists
+adapter: main_lora                         # trained base = google/gemma-4-e4b-it (adapter_config.json)
 instruction: !include prompts/system.md
 tools:
   # execution / lifecycle
@@ -20,7 +20,8 @@ tools:
   - search_similar_code
   - get_code_subgraph
   # read-only explorer wrapped as AgentTool: keeps exploration noise out of
-  # this agent's 32k context window (HARNESS_README §10.4)
+  # this agent's context window (HARNESS_README §10.4; model context = 128k, so cap ONE
+  # assistant turn via configs/sampling.yaml max_output_tokens instead of shrinking the context)
   - agent_tool:
       config_path: sub_agents/code_analyzer.yaml
       skip_summarization: true

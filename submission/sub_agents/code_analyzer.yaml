@@ -7,7 +7,11 @@ description: >-
   Returns a short structured report: exact file paths, line ranges, root cause,
   and the minimal code change to apply. Does not edit files.
 model: gemma-4-e4b-it-qat-w4a16-ct
-# adapter: tool_lora
+# The analyzer reads a 3k-char report out of a 3k-token turn; its LoRA is trained by the Colab
+# notebook (`BUILD_MODE = "main+analyzer"`) into submission/adapters/analyzer_lora.
+# NOTE: `build_submission.py --check-only` fails until that directory exists (adapter_config.json +
+# adapter_model.safetensors); comment this line again to package a main-only submission.
+adapter: analyzer_lora
 instruction: !include ../prompts/analyzer.md
 tools:
   - read_file

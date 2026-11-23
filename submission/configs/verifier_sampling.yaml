@@ -3,12 +3,12 @@
 # inside `thinking_config`, never at the top level.
 # ADK/Gemini naming map (the harness schema has no `max_tokens` / `max_thoughts`):
 #   max_tokens   -> max_output_tokens (1024)
-#   max_thoughts -> thinking_config.thinking_budget (512; 2048 is the other allowed step)
-# Verification only has to read a pytest tail and emit ~6 short lines, so it gets a tiny
-# budget and a low temperature: a STOP-lost / rambling verdict wastes the parent's turns.
+#   max_thoughts -> thinking_config.thinking_budget (2048 matches the root agent)
+# Verification only has to read a pytest tail and emit ~6 short lines, so it stays deterministic
+# and small: a STOP-lost / rambling verdict wastes the parent's turns.
 temperature: 0.1
 top_p: 0.9
 max_output_tokens: 1024         # the verdict is ~150 tokens; 1024 leaves room for one re-read
 thinking_config:
-  thinking_budget: 512          # 512 or 2048; 0 would disable thinking entirely
+  thinking_budget: 2048         # same thinking step as the root agent (configs/sampling.yaml)
   include_thoughts: false       # thoughts never enter the parent's context (HARNESS §14.2)
