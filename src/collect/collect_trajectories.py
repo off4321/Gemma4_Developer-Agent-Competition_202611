@@ -283,12 +283,26 @@ def initial_user_prompt(problem_statement: str, repo: str, budget: dict[str, Any
 
 
 def read_observation(filepath: str, start_line: int, end_line: int, body: str,
-                     limit: int = 1200) -> dict[str, Any]:
-    """`read_file` の応答相当（実 harness は全文でなく頼んだ範囲の raw text を返す）。"""
+                     limit: int = 1200,
+                     include: str | None = None) -> dict[str, Any]:
+    """`read_file` の応答相当（実 harness は全文でなく頼んだ範囲の raw text を返す）。
+
+    `include` は直後の tool call がこの読みから書き写す文字列（通常は直後の edit_file の
+    old_string）。切り詰め途中で消えると「読んでから編集」の意味が無い軌跡（未読の old_string を
+    書き写す軌跡）になるので、その文字列が body に在る間は切り詰めるな。
+    """
     content = body.strip("\n")
     truncated = len(content) > limit
+    text = content[:limit] + ("\n..." if truncated else "")
+    if include and include.strip() and include not in text:
+        text, truncated = content, False
     return {"status": "ok", "filepath": filepath, "start_line": start_line, "end_line": end_line,
-            "content": content[:limit] + ("\n..." if truncated else ""), "truncated": truncated}
+            "content": text, "truncated": truncated}
+
+
+def read_covers(read_contents: dict[str, list[str]], filepath: str, old_string: str) -> bool:
+    """既に返した read_file の content に old_string がそのまま在るか（＝追加 read 不要か）。"""
+    return any(old_string in content for content in read_contents.get(filepath, []))
 
 
 def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str, Any],
@@ -324,15 +338,18 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
 
     call_index = 0
     files_changed = {e["filepath"] for e in edits}
-    # 各 file の最初の edit_file の前に read_file を 1 発入れる。eval trace は 10 task 0 resolved
-    # で、その内訳が「見ていない行を old_string に書いて edit_file が一致しない」巡りだった
-    # = edit_file する前に target 範囲を読む、という挙動そのものが未学習だった。
-    read_targets: set[str] = set()
+    # eval trace は 10 task 0 resolved で、その内訳が「見ていない行を old_string に書いて edit_file が
+    # 一致しない」巡りだった = edit_file する前に target 範囲を読む、という挙動そのものが未学習だった。
+    # 1 ファイル 1 read では不十分で、old_string を読んでいない時に限って read を追加する。
+    read_contents: dict[str, list[str]] = {}
     n_reads = 0
     for i, edit in enumerate(edits):
         filepath = edit["filepath"]
-        if edit["kind"] == "edit_file" and filepath not in read_targets:
-            read_targets.add(filepath)
+        # 各 edit_file の直前に、その old_string をそのまま含んだ read_file を置く。1 ファイル 1 read
+        # だと 2 発目の hunk を未読のまま edit するので、「この old_string を読んだか」で判定して
+        # 足りなければ追加で読む（write_file の新規 file は読む対象が無いので read なし）。
+        if (edit["kind"] == "edit_file"
+                and not read_covers(read_contents, filepath, edit["old_string"])):
             n_reads += 1
             start_line = int(edit.get("start_line") or 1)
             end_line = max(int(edit.get("end_line") or start_line), start_line)
@@ -340,11 +357,14 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
                        "edit_file only matches text I have actually seen."
                        if not i else
                        f"Read {filepath}:{start_line}-{end_line} before editing it there.")
+            observation = read_observation(filepath, start_line, end_line, edit["old_string"],
+                                          include=edit["old_string"])
+            read_contents.setdefault(filepath, []).append(str(observation["content"]))
             call_index += 1
             append_call(messages, call_index, thought,
                         {"name": "read_file", "arguments": {
                             "filepath": filepath, "start_line": start_line, "end_line": end_line}},
-                        read_observation(filepath, start_line, end_line, edit["old_string"]),
+                        observation,
                         native_tools)
         if i:
             thought = f"Apply the remaining change in {filepath}."
@@ -578,7 +598,8 @@ def build_analyzer_trajectory(task: dict[str, Any], system_prompt: str, budget: 
                     {"name": "read_file", "arguments": {
                         "filepath": h["path"], "start_line": start_line,
                         "end_line": start_line + 40}},
-                    read_observation(h["path"], start_line, start_line + 40, h["old_string"]),
+                    read_observation(h["path"], start_line, start_line + 40, h["old_string"],
+                                     include=h["old_string"]),
                     native_tools)
 
     report = analyzer_report(hunks, targets)
@@ -709,7 +730,8 @@ def build_no_patch_trajectory(task: dict[str, Any], system_prompt: str, budget: 
                 f"Read the block that consumes it: {filepath}:{start_line}-{end_line}.",
                 {"name": "read_file", "arguments": {"filepath": filepath,
                                                     "start_line": start_line, "end_line": end_line}},
-                read_observation(filepath, start_line, end_line, hunk["old_string"]),
+                read_observation(filepath, start_line, end_line, hunk["old_string"],
+                                 include=hunk["old_string"]),
                 native_tools)
     call_index += 1
     append_call(messages, call_index,

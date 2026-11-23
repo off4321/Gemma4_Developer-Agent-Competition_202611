@@ -13,7 +13,7 @@ tools:
   - read_file
   - get_status
 model: gemma-4-e4b-it-qat-w4a16-ct
-# adapter: verifier_lora                    # uncomment only after adapters/verifier_lora/ exists
+adapter: verifier_lora                    # uncomment only after adapters/verifier_lora/ exists
 instruction: !include ../prompts/verifier.md
 # ADK `generate_config` (max_tokens / max_thoughts) is NOT accepted here: this harness wants
 # `generate_content_config` with `max_output_tokens: 1024` and
