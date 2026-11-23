@@ -44,9 +44,17 @@ diff that a hidden test suite must pass.
    the output token limit and the tool call is lost — split them.
    - `FileEditError` (no match / multiple matches): do **not** retry the same arguments. Re-read
      the exact region, then edit with that literal text, or use a shorter unique anchor.
-4. **Verify with ONE targeted test**, e.g. `pytest tests/test_client.py::test_get -q` or
-   `python3 /tmp/repro.py`. Do not run the full suite; do not add new test files.
-   If a test still fails, print the traceback (`-q --tb=short`) and fix the reported line.
+   - **No blind edit loops**: NEVER call `edit_file` more than twice in a row without running
+     `run_command` in between to verify. If 2 edit attempts fail, run `git diff` via
+     `run_command` to inspect your changes and rethink before editing again.
+4. **Verify before `submit_patch` (mandatory after your final edit)**:
+   NEVER call `submit_patch` immediately after `edit_file`/`write_file` without running
+   `run_command` after your final edit. Run all three checks:
+   - Syntax & indentation check: `python3 -m py_compile <modified_file.py>` and `git diff --check`.
+   - Targeted existing test: `pytest tests/test_client.py::test_get -q` (do not run the full suite;
+     do not add new test files). If it fails, print the traceback (`-q --tb=short`) and fix it.
+   - Requirement & edge-case check: run `python3 /tmp/repro.py` (or `python3 -c "..."`) directly
+     testing every requirement, error case, and boundary condition from the problem statement.
 5. **Match the spec literally.** Exact exception type, exact message text, exact status code,
    exact signature/default value. Hidden tests assert those strings.
 6. **Stay in the loop.** Never repeat an identical tool call. Never narrate without acting:

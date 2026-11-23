@@ -19,7 +19,7 @@ PIPELINE     = python3 src/pipeline/run_pipeline.py
 VARIANT     ?= baseline
 STAGES      ?= gpu
 
-.PHONY: help validate zip collect analyze quota push-code push-submission push-eval push-train \
+.PHONY: help validate zip collect analyze quota push-code push-submission push-submission-zip push-eval push-train \
         measure-notebook push-measure-notebook colab-notebook colab-notebook-hf train-notebook parity failures scoreboard scoreboard-official scoreboard-table \
         status logs logs-follow out-eval out-train submit submissions clean all \
         pipeline-variants pipeline-plan pipeline-local pipeline-post pipeline-eval pipeline-eval-save \
@@ -44,7 +44,8 @@ help:
 	@echo "kaggle:"
 	@echo "  make quota             GPU/TPU quota remaining"
 	@echo "  make push-code         upload src/ as dataset $(CODE_DATASET)"
-	@echo "  make push-submission   upload submission/ as dataset $(SUB_DATASET)"
+	@echo "  make push-submission     upload submission/ as dataset $(SUB_DATASET)"
+	@echo "  make push-submission-zip upload submission.zip as private dataset $(SUB_ZIP_DATASET)"
 	@echo "  make push-eval         push kernels/eval and START the run (GPU quota!)"
 	@echo "  make push-eval-save    push kernels/eval without running (--no-run)"
 	@echo "  make probe                CPU probe kernel を実行（GPU quota 0）: python/wheel tag/mount 実測"
@@ -117,6 +118,21 @@ push-submission: validate
 	  cp -r submission/adapters .kaggle/dataset-submission/adapters; fi
 	@$(KAGGLE) datasets version -p .kaggle/dataset-submission -m "sync submission/ $$(date -u +%Y-%m-%dT%H:%M:%SZ)" -r tar -q \
 	  || $(KAGGLE) datasets create -p .kaggle/dataset-submission -r tar -q
+
+SUB_ZIP_DATASET ?= gemma4-my-submission
+push-submission-zip: submission.zip
+	@mkdir -p .kaggle/dataset-submission-zip
+	@cp -f submission.zip .kaggle/dataset-submission-zip/submission.zip
+	@user="$(USERNAME)"; \
+	if [ "$$user" = "<username>" ]; then \
+	  user=$$($(KAGGLE) config view | sed -n 's/^- username: //p'); \
+	fi; \
+	test -n "$$user" || (echo "USERNAME を指定してください (例: make push-submission-zip USERNAME=your_id)"; exit 2); \
+	printf '{\n  "title": "%s",\n  "id": "%s/%s",\n  "licenses": [{"name": "CC0-1.0"}]\n}\n' \
+	  "$(SUB_ZIP_DATASET)" "$$user" "$(SUB_ZIP_DATASET)" > .kaggle/dataset-submission-zip/dataset-metadata.json; \
+	($(KAGGLE) datasets version -p .kaggle/dataset-submission-zip -m "sync submission.zip $$(date -u +%Y-%m-%dT%H:%M:%SZ)" -q \
+	  || $(KAGGLE) datasets create -p .kaggle/dataset-submission-zip -q) && \
+	echo "[push-submission-zip] uploaded to $$user/$(SUB_ZIP_DATASET) (private)"
 
 push-eval: push-code push-submission
 	$(KAGGLE) kernels push -p kernels/eval
@@ -230,4 +246,4 @@ clean:
 	rm -rf submission.zip .kaggle/dataset-code/src .kaggle/dataset-submission/prompts \
 	       .kaggle/dataset-submission/configs .kaggle/dataset-submission/sub_agents \
 	       .kaggle/dataset-submission/adapters .kaggle/dataset-submission/agent.yaml \
-	       .kaggle/dataset-submission/eval_config.yaml
+	       .kaggle/dataset-submission/eval_config.yaml .kaggle/dataset-submission-zip

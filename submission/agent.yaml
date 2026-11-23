@@ -4,7 +4,7 @@
 # ============================================================================
 name: gemma_e4b_developer_agent
 model: gemma-4-e4b-it-qat-w4a16-ct          # must be one of ALLOWED_MODEL_NAMES
-# adapter: main_lora                         # uncomment only after adapters/main_lora/ exists
+adapter: main_lora                         # uncomment only after adapters/main_lora/ exists
 instruction: !include prompts/system.md
 tools:
   # execution / lifecycle

@@ -5,8 +5,8 @@
 # -> `thinking_budget` / `include_thoughts` MUST live under `thinking_config`.
 temperature: 0.2
 top_p: 0.95
-max_output_tokens: 16384        # >= 8192 recommended: 4096 truncates <|tool_call|> mid-call
+max_output_tokens: 8192         # 32K上限に対して入力枠(~24K)を確保しつつ、<|tool_call|>途切れを防止
 thinking_config:
-  thinking_budget: 4096         # 0 disables thinking; <= 32768 (vLLM max_model_len)
-  include_thoughts: true        # keep thought parts in history (helps tool-call continuity)
+  thinking_budget: 2048         # 0 disables thinking; <= 32768 (vLLM max_model_len)
+  include_thoughts: false       # 履歴への思考蓄積を防ぎ ContextWindowExceededError を回避
   # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm

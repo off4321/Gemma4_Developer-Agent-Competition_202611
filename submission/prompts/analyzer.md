@@ -32,3 +32,5 @@ parent engineer a decision-ready report.
 - If you cannot localize it, output `**Target files**: not found` plus what you ruled out. A short
   "not here" is worth more to the parent than a guessed path.
 - Obey the format above exactly: the parent parses `Target files` / `Test to run` literally.
+- Keep your response concise so the parent agent's 32K context window stays clean: report only
+  relevant line ranges, key signatures/imports, and exact test paths without pasting large code blocks.

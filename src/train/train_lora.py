@@ -7,6 +7,11 @@ loss masking がこのスクリプトの要点: system 指示と tool 観測は 
 assistant が出す思考 text と tool call 直列化だけを誤差にする。そうしないと、
 「観測を再現する」方向に学習して tool call が壊れる。
 
+もう一つの要点が会話丸ごと render すること（`_render_conversation`）: message を 1 件ずつ
+isolated で chat template に当てると Gemma 4 は tool call を直列化せず、`<|tool_call>` の代わりに
+`<|turn>model{...}` のような文字列を再現する adapter が育つ（`main_lora` 崩れの本体）。
+`encode_conversation` は `norm[:i+1]` と `norm[:i]` の token 差分で turn を切り出す。
+
 学習 base と提出後に実際に動く model は違う: ここは bf16 の google/gemma-4-e4b-it で学習し、
 adapter_config.json の base_model_name_or_path を提供モデル
 gemma-4-e4b-it-qat-w4a16-ct に書き換える（--serve_model）。公式サンプル adapter も同じことをする。
@@ -79,7 +84,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=float, default=3.0)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-5,
+                   help="5e-5 default: 1e-4 on a 4-bit base with LoRA+ corrupted tool_call tokens on ~105 trajectories")
     p.add_argument("--warmup_steps", type=int, default=20)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -178,6 +184,16 @@ def render_message(tokenizer: AutoTokenizer, message: Message) -> str:
     return text + "<tool_call>\n" + json.dumps(payload, ensure_ascii=False) + "\n</tool_call>\n"
 
 
+def _render_conversation(tokenizer: AutoTokenizer, messages: Conversation) -> str:
+    """Render a whole conversation with the model's chat template.
+
+    Gemma 4 serialises `tool_calls` only when the template sees the turns around the call. Handing
+    it `[message]` takes a template branch without the call header, and the adapter then answers
+    `<|tool_call>` with literal `<|turn>model{...}` garbage.
+    """
+    return tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+
+
 def is_supervised(role: str | None, args: argparse.Namespace) -> bool:
     """The whole loss policy in one place: assistant always, system/tool only when asked for."""
     if role in ASSISTANT_ROLES:
@@ -191,16 +207,36 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
                         args: argparse.Namespace) -> Example | None:
     """Tokenize a conversation turn by turn, labelling unsupervised tokens IGNORE.
 
+    A turn is the token delta between the full renders of `norm[:i + 1]` and `norm[:i]`, so the
+    template keeps the multi-turn context it needs to serialise `tool_calls` (rendering each
+    message alone is what corrupted `main_lora`). Fall back to `render_message` per turn when a
+    template rejects a partial conversation.
+
     Returns None when masking leaves nothing to learn, so the caller can drop the example.
     """
+    norm = [_normalize_tool_calls(message) for message in messages]
     input_ids: list[int] = []
     labels: list[int] = []
     bos_id = tokenizer.bos_token_id
+    unstable = False
 
-    for index, message in enumerate(messages):
-        ids = tokenizer(render_message(tokenizer, message), add_special_tokens=False)["input_ids"]
-        if index > 0 and ids and ids[0] == bos_id:
-            ids = ids[1:]  # the template re-adds BOS every turn; keep only the leading one
+    for index, message in enumerate(norm):
+        try:
+            prefix = tokenizer(_render_conversation(tokenizer, norm[:index + 1]),
+                               add_special_tokens=False)["input_ids"]
+        except Exception as exc:  # a template that refuses a partial conversation
+            print(f"[warn] apply_chat_template(messages[:{index + 1}]) failed ({exc}); "
+                  f"falling back to render_message for this turn")
+            ids = tokenizer(render_message(tokenizer, message), add_special_tokens=False)["input_ids"]
+            if index and bos_id is not None and ids and ids[0] == bos_id:
+                ids = ids[1:]  # the template re-adds BOS every turn; keep only the leading one
+        else:
+            # a template that re-renders from scratch (rather than appending a turn) would shift the
+            # labels, so say so once instead of silently mislabelling every turn after it
+            if not unstable and prefix[:len(input_ids)] != input_ids:
+                unstable = True
+                print("[warn] chat template is not prefix-stable: labels may shift at turn edges")
+            ids = prefix[len(input_ids):]  # delta against the prefix already accumulated
         supervised = is_supervised(message.get("role"), args)
         input_ids.extend(ids)
         labels.extend(ids if supervised else [IGNORE] * len(ids))
@@ -227,6 +263,10 @@ def build_dataset(tokenizer: AutoTokenizer, conversations: list[Conversation], a
           f"{sum(tokens) / max(1, len(rows)):.0f} supervised tokens/example")
     if not rows:
         raise SystemExit("[error] every example collapsed to zero supervised tokens")
+
+    # print the supervised text so a broken tool-call serialisation is visible before training starts
+    supervised_ids = [t for t, label in zip(rows[0]["input_ids"], rows[0]["labels"]) if label != IGNORE]
+    print("[data] sample supervised text:\n" + tokenizer.decode(supervised_ids))
     return Dataset.from_list(rows)
 
 

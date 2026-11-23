@@ -67,8 +67,9 @@ def build_notebook() -> nbf.NotebookNode:
             `main_lora` / `analyzer_lora` / `verifier_lora` の 3 本を作成・検証するためのノートブックです。
             1 セット（cell 1 → 6）で 1 本学習できるので、`ADAPTER_NAME` / `ROLE` を切り替えて 3 周してください。
 
-            - **RSLoRA** (`--use_rslora`): 高ランクでも勾配が潰れにくい
-            - **LoRA+** (`--lora_plus_ratio 16.0`): `lora_B` の学習率を上げてコード・ツール形式の収束を高速化
+            - **RSLoRA** (`--use_rslora`): 高ランクでも勾配が潰れにくい（既定 OFF。rank を 64 以上に上げるときだけ ON）
+            - **LoRA+** (`--lora_plus_ratio 4.0`): `lora_B` の学習率を上げてツール形式の収束を早める。倍率を稼ぎすぎると
+              （`16.0` 以上）tool call がただの文字列として学習され、tool call 崩れの原因になる（学習率の既定は `--lr 5e-5`）
             - 学習ベースは `google/gemma-4-e4b-it`、保存時の `adapter_config.json` は本番の `google/gemma-4-e4b-it-qat-w4a16-ct` に自動書き換えされます
 
             cell 1 → 2 → 3 → 4 → 5 → 6 の順に実行します。cell 1 の `pip install` で Colab が「ランタイムを再起動」と
@@ -285,11 +286,20 @@ def build_notebook() -> nbf.NotebookNode:
               `data/trajectories.jsonl` / `data/trajectories_analyzer.jsonl` / `data/trajectories_verifier.jsonl` と
               `data/dpo_pairs_main.jsonl` / `data/dpo_pairs_analyzer.jsonl` / `data/dpo_pairs_verifier.jsonl`
               （main は従来の `data/trajectories.jsonl` のまま）
-            - `R` / `ALPHA`: LoRA ランクとスケーリング。`ALPHA = 2 * R` 目安
-            - `USE_RSLORA`: RSLoRA（`--use_rslora`）。高ランクでも勾配が潰れにくく、rank を変えても学習率を再調整しなくて済みます
-            - `LORA_PLUS_RATIO`: LoRA+ の倍率（`--lora_plus_ratio`）。`lora_B` の学習率を上げてツール呼び出しの収束を早めます。1.0 で無効
-            - `USE_4BIT`: 4bit 量子化（`--use_4bit`）。L4 15GB に収まらないときだけ有効化
-            - `SFT_EPOCHS` / `RUN_DPO` / `DPO_EPOCHS`: Stage 1 のエポック数、Stage 2（DPO）を回すか、そのエポック数
+            - `R` / `ALPHA`: LoRA ランクとスケーリング。既定 `16` / `32`（`ALPHA = 2 * R` 目安）。105 件程度の軌跡では rank より学習率の
+              方が tool call 形式に効くので、まず既定の小さい方から触る
+            - `USE_RSLORA`: RSLoRA（`--use_rslora`）。高ランクでも勾配が潰れにくいが、既定は `False`（4bit 基底 + LoRA+ で
+              実効 lr が立ちすぎるため）。rank を 64 以上に上げる検証のときだけ `True`
+            - `LORA_PLUS_RATIO`: LoRA+ の倍率（`--lora_plus_ratio`）。`lora_B` の学習率を上げてツール呼び出しの収束を早めます。1.0 で無効。
+              既定 `4.0`（`16.0` に振ると tool call の直列化が `<|tool_call>` ではなく `<|turn>model{...}` という文字列として
+              固まる。`main_lora` の tool call 崩れはこれが本体）
+            - 学習率 `--lr` は cell 4 で `5e-5` を明示する（`train_lora.py` の既定も `5e-5`。1e-4 を 4bit + LoRA+ で当てると
+              特殊 token の embedding が飛ぶ）。cell 4 は併せて `--max_len 6144`（1 会話の token 上限）と `--max_examples 200`
+              （教材の会話数上限）で締める — L4 15GB で QLoRA が落ちず、105 件超の周回で tool call 形式だけ暗記しないため
+            - `USE_4BIT`: 4bit 量子化（`--use_4bit`）。既定 `True` — L4 15GB に bf16 の e4b は載らず、cell 4 / 5 は QLoRA 前提。
+              bf16 で載る GPU で検証するときだけ `False`
+            - `SFT_EPOCHS` / `RUN_DPO` / `DPO_EPOCHS`: Stage 1 のエポック数（既定 `2.0` — 105 件で 3 周すると tool call の
+              形式そのものが過学習で崩れる）、Stage 2（DPO）を回すか、そのエポック数
             - `TASKS_JSONL` / `RESULTS_DIR`: cell 2 で置いた `data/tasks.jsonl` と `results/` のパス
 
             出力先 `OUT_DIR` は `submission/adapters/<ADAPTER_NAME>` 固定です（Kaggle 側で学習した場合も同じ相対パスに
@@ -301,12 +311,12 @@ def build_notebook() -> nbf.NotebookNode:
             #@title 3. 学習設定（Multi-LoRA / RSLoRA / LoRA+ / DPO）
             ADAPTER_NAME = "main_lora"          #@param ["main_lora", "analyzer_lora", "verifier_lora"]
             ROLE = "main"                       #@param ["main", "analyzer", "verifier"]
-            R = 32                              #@param {type:"integer"}
-            ALPHA = 64                          #@param {type:"integer"}
-            USE_RSLORA = True                   #@param {type:"boolean"}
-            LORA_PLUS_RATIO = 16.0              #@param {type:"number"}
-            USE_4BIT = False                    #@param {type:"boolean"}
-            SFT_EPOCHS = 3.0                    #@param {type:"number"}
+            R = 16                              #@param {type:"integer"}
+            ALPHA = 32                          #@param {type:"integer"}
+            USE_RSLORA = False                  #@param {type:"boolean"}
+            LORA_PLUS_RATIO = 4.0               #@param {type:"number"}
+            USE_4BIT = True                     #@param {type:"boolean"}
+            SFT_EPOCHS = 2.0                    #@param {type:"number"}
             RUN_DPO = True                      #@param {type:"boolean"}
             DPO_EPOCHS = 1.0                    #@param {type:"number"}
 
@@ -345,8 +355,19 @@ def build_notebook() -> nbf.NotebookNode:
             2. `src/train/train_lora.py` が cell 3 の設定（RSLoRA / LoRA+ / 4bit）で LoRA を学習し、`OUT_DIR`
                （`submission/adapters/<ADAPTER_NAME>`）に保存します。
 
-            試走させたいときは `collect_trajectories.py` に `--limit N`、`train_lora.py` に `--max_examples N` を足して
-            件数を絞ってください（初回は tokenizer 読み込みだけで数分かかります）。
+            ### cell 4 が `train_lora.py` に渡す固定引数（tool call を壊さないための値）
+
+            - `--lr 5e-5` — 既定値と同じ。4bit 基底 + LoRA+ に `1e-4` を当てると tool call / turn の特殊 token が飛んで、
+              生成が `tool_call` ではなく `<|turn>model{...}` というただの文字列に落ちる
+            - `--max_len 6144` — L4 15GB の QLoRA で落ちない長さの上限。main 軌跡は system 指示 + 観測で伸びるが、
+              8192 にすると OOM する。超えた末尾 turn は切り捨てる
+            - `--max_examples 200` — 教材を 200 会話で打ち切る。105 件を超えて周回させると tool call の「形式」だけを
+              暗記して、中身の JSON が壊れ始める
+
+            試走させたいときは `collect_trajectories.py` に `--limit N` を付け、`train_lora.py` の `--max_examples` を下げて
+            件数を絞ってください（初回は tokenizer 読み込みだけで数分かかります）。`train_lora.py` は学習開始前に
+            `[data] sample supervised text:` として 1 件目の supervised 部分だけを decode した text を print します。
+            ここに tool call が正しく直列化されていなければ、学習を止めて教材側を見ることになります。
             """
         ),
         _code(
@@ -362,11 +383,18 @@ def build_notebook() -> nbf.NotebookNode:
                 --output {TRAJECTORIES_JSONL}
             print("[stage1] training data:", TRAJECTORIES_JSONL, "-> adapter:", OUT_DIR)
 
+            # train_lora.py の引数は tool call 保全が最優先（上げる方向に振ると形式が壊れる）:
+            #   --lr 5e-5          4bit 基底 + LoRA+ で 1e-4 を当てると特殊 token の embedding が飛ぶ（既定も 5e-5）
+            #   --max_len 6144     L4 15GB の QLoRA で落ちない長さ。これを超えた末尾 turn は切り捨てる
+            #   --max_examples 200 教材を 200 会話で打ち切る（105 件超の周回だと tool call の形式だけ暗記する）
             !python3 src/train/train_lora.py \\
                 --data {TRAJECTORIES_JSONL} \\
                 --out_dir {OUT_DIR} \\
                 --r {R} --alpha {ALPHA} \\
                 --epochs {SFT_EPOCHS} \\
+                --lr 5e-5 \\
+                --max_len 6144 \\
+                --max_examples 200 \\
                 {EXTRA_FLAGS}
             """
         ),
@@ -386,6 +414,13 @@ def build_notebook() -> nbf.NotebookNode:
 
             `RUN_DPO = False` または `results/` が無い場合は実行せず `[skip]`、ペアが 0 件なら `[skip]` です。
             DPO は Stage 1 より学習率が小さく（既定 5e-6）、`--beta` は 0.1 固定です。
+            LoRA の形は `EXTRA_FLAGS` 経由で Stage 1 と揃う（`--lora_plus_ratio 4.0` と `--use_4bit`、`--use_rslora` は既定 OFF）ので、
+            Stage 1 の adapter にそのまま `--resume_from` できます。
+
+            token budget だけ Stage 1 と別です。Stage 1 は cell 4 で `--max_len 6144` / `--max_examples 200` に締めていますが、
+            `train_dpo.py` は自前の `--max_len`（既定 4096）で prompt / chosen / rejected を切り捨て、
+            `--max_examples`（既定は全件）でペア数を見ます。chosen / rejected が途中で切れているときは
+            cell 5 のコマンドに `--max_len 6144` を足してください（L4 で OOM したら下げる）。
             """
         ),
         _code(
