@@ -54,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     # DPO & optimisation
     p.add_argument("--beta", type=float, default=0.1, help="DPO KL penalty coefficient")
     p.add_argument("--max_len", type=int, default=8192)
-    p.add_argument("--max_prompt_len", type=int, default=3584)
+    p.add_argument("--max_prompt_len", type=int, default=None,
+                   help="prompt token cap (default: max_len // 2)")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
@@ -66,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--max_examples", type=int, default=0)
     p.add_argument("--dry_run", action="store_true", help="render 1 pair, save adapter, exit")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.max_prompt_len is None:
+        args.max_prompt_len = max(512, args.max_len // 2)
+    return args
 
 
 def _render_pair_texts(
