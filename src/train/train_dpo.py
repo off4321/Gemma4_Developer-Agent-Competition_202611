@@ -9,7 +9,9 @@ and saves a vLLM-compatible `.safetensors` adapter targeting `gemma-4-e4b-it-qat
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import math
 import os
 import random
 import sys
@@ -161,24 +163,34 @@ def main() -> int:
     except ImportError as exc:
         raise SystemExit("[error] `trl` is required for DPO (`pip install -q trl`)") from exc
 
-    dpo_args = DPOConfig(
-        output_dir=str(Path(args.out_dir) / "_checkpoints"),
-        beta=args.beta,
-        learning_rate=args.lr,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        num_train_epochs=args.epochs,
-        warmup_ratio=args.warmup_ratio,
-        max_length=args.max_len,
-        max_prompt_length=args.max_prompt_len,
-        logging_steps=5,
-        save_strategy="no",
-        bf16=(not args.use_4bit and torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
-        fp16=(not args.use_4bit and torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
-        remove_unused_columns=False,
-        report_to="none",
-        seed=args.seed,
-    )
+    dpo_fields = {f.name for f in dataclasses.fields(DPOConfig)}
+    total_steps = max(1, math.ceil(len(dataset) / max(1, args.batch_size * args.grad_accum) * args.epochs))
+    dpo_kwargs: dict[str, Any] = {
+        "output_dir": str(Path(args.out_dir) / "_checkpoints"),
+        "beta": args.beta,
+        "learning_rate": args.lr,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "num_train_epochs": args.epochs,
+        "max_length": args.max_len,
+        "logging_steps": 5,
+        "save_strategy": "no",
+        "bf16": (not args.use_4bit and torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+        "fp16": (not args.use_4bit and torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "remove_unused_columns": False,
+        "report_to": "none",
+        "seed": args.seed,
+    }
+    if "max_prompt_length" in dpo_fields:
+        dpo_kwargs["max_prompt_length"] = args.max_prompt_len
+    if "warmup_ratio" in dpo_fields:
+        dpo_kwargs["warmup_ratio"] = args.warmup_ratio
+    elif "warmup_steps" in dpo_fields:
+        dpo_kwargs["warmup_steps"] = max(1, int(total_steps * args.warmup_ratio))
+
+    dpo_args = DPOConfig(**{k: v for k, v in dpo_kwargs.items() if k in dpo_fields})
     optimizer = build_optimizer(model, args)
     trainer = DPOTrainer(
         model=model,
