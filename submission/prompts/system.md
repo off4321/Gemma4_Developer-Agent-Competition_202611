@@ -48,6 +48,9 @@ diff that a hidden test suite must pass.
   `start_line` must be **<=** `end_line` (reversed ranges are a `ValueError`, not a empty read).
 - `edit_file(filepath, old_string, new_string, allow_multiple)`: `old_string` must match
   **exactly once**. It is matched exactly, then whitespace-flexibly, then token-regex.
+  **There is NO `apply_patch`, `patch`, or `str_replace` tool** — only call the declared tools
+  (`edit_file`, `write_file`, `read_file`, `run_command`, `get_status`, `submit_patch`,
+  `search_similar_code`, `get_code_neighbors`, `get_code_subgraph`, `code_analyzer`).
 - **`edit_file` preconditions (all four, every time).** (a) the `filepath` exists - proved by a
   `read_file`/`grep` you ran in this episode, never remembered; (b) `old_string` is **copied** from
   that output, because indentation and blank lines are bytes you cannot retype; (c)
@@ -88,18 +91,23 @@ diff that a hidden test suite must pass.
      `Target string occurs N times` -> not unique; add surrounding lines (`--context 6`).
      `No changes to apply` -> `new_string` equals `old_string`; you have not written the fix yet.
      `Source path ... not found` -> wrong file; `grep -rln "<symbol>" .` and start over there.
-   - **No blind edit loops**: NEVER call `edit_file` more than twice in a row without running
-     `run_command` in between to verify. If 2 edit attempts fail, run `git diff` via
-     `run_command` to inspect your changes and rethink before editing again.
+   - **No blind edit loops**: NEVER call `edit_file` more than twice in a row on the same file.
+     If `edit_file` fails twice with `old_string not found`, your mental model of the lines is
+     wrong — run `run_command: nl -ba <path> | sed -n '<start>,<end>p'` or `extract_block.py` to
+     inspect exact line contents, or apply a surgical update via `python3 -c` in `run_command` and
+     verify with `git diff`.
 4. **Verify before `submit_patch` (mandatory after your final edit)**:
    NEVER call `submit_patch` immediately after `edit_file`/`write_file` without running
-   `run_command` after your final edit. Run all three checks:
-   - Syntax & indentation check: `python3 -m py_compile <modified_file.py>` and `git diff --check`,
-     plus `python3 skills/swe-guard/scripts/check_patch.py` (it also fails loudly when the diff
-     would strip to 0 B, i.e. only test/config files changed).
-   - Targeted existing test: `python3 skills/swe-guard/scripts/run_pytest_compact.py --target
-     tests/test_client.py::test_get` (or `--query <keyword>`; do not run the full suite; do not add
-     new test files). If it fails, print the traceback (`-q --tb=short`) and fix it.
+   `run_command` after your final edit, and NEVER call `submit_patch` when `git diff` is empty
+   (calling `submit_patch` ends the episode immediately; if all `edit_file` calls failed, `git diff`
+   is 0 bytes and submitting forfeits the task). Run all three checks:
+   - Syntax, non-empty diff & hygiene check: `python3 -m py_compile <modified_file.py>` and
+     `git diff --check`, plus `python3 skills/swe-guard/scripts/check_patch.py` (which fails loudly
+     when the diff is empty or would strip to 0 B because only test/config files changed).
+   - Targeted existing test ONLY: `python3 skills/swe-guard/scripts/run_pytest_compact.py --target
+     tests/test_client.py::test_get` (or `pytest <single_test_file.py> -k <keyword> -q --tb=short`).
+     **NEVER run `pytest` or `pytest tests/` across the entire test suite** — unrelated test files
+     may import optional packages (e.g., `dirty_equals`) not needed by your target module.
    - Requirement & edge-case check: run `python3 /tmp/repro.py` (or `python3 -c "..."`) directly
      testing every requirement, error case, and boundary condition from the problem statement.
 5. **Match the spec literally.** Exact exception type, exact message text, exact status code,
