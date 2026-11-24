@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -44,6 +45,13 @@ from collect.collect_trajectories import (  # noqa: E402
 
 ANALYZER_TOOLS = {"read_file", "run_command", "search_similar_code", "get_code_neighbors", "get_code_subgraph"}
 VERIFIER_TOOLS = {"run_command", "read_file", "get_status"}
+MAIN_TOOLS = {
+    "run_command", "get_status", "submit_patch", "read_file", "edit_file", "write_file",
+    "get_code_neighbors", "search_similar_code", "get_code_subgraph",
+    "code_analyzer", "code_analyzer_agent", "agent_tool",
+    "load_skill", "list_skills", "load_skill_resource", "run_skill_script",
+}
+SKILL_META_TOOLS = {"load_skill", "list_skills", "load_skill_resource", "run_skill_script"}
 ROLE_TOOLS: dict[str, set[str]] = {"analyzer": ANALYZER_TOOLS, "verifier": VERIFIER_TOOLS}
 # DEFAULT_BUDGET は submission/eval_config.yaml と揃える（教材 user prompt に書き写す値なので
 # 80/150 の旧既定は使わない）。
@@ -330,18 +338,26 @@ def _load_traces(results_dirs: list[Path], role: str,
     化する事故が無い。
     """
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: {"ok": [], "fail": []})
+    tr_by_dir: dict[Path, dict[str, dict[str, Any]]] = {}
     for root in results_dirs:
         if not root.exists():
             continue
-        task_results = _task_results_for(root, task_results_file)
+        root_results = _task_results_for(root, task_results_file)
         files = sorted(root.rglob("trace_*.json")) or sorted(root.rglob("*.json"))
         for path in files:
+            if path.name in (TASK_RESULTS_NAME, "summary.json"):
+                continue
             traj = normalize_trace(path)
             if not traj or not _role_matches(traj, role):
                 continue
             iid = _task_key(path, traj)
-            if task_results:
-                _apply_task_result(traj, iid, task_results)
+            local_results = root_results
+            if not local_results and task_results_file is None:
+                if path.parent not in tr_by_dir:
+                    tr_by_dir[path.parent] = _task_results_for(path.parent, None)
+                local_results = tr_by_dir[path.parent]
+            if local_results:
+                _apply_task_result(traj, iid, local_results)
             bucket = "ok" if traj["meta"].get("resolved") is True else "fail"
             grouped[iid][bucket].append(traj)
     return grouped
@@ -421,6 +437,322 @@ def build_pairs(
     return pairs
 
 
+def _parse_call_args(call: dict[str, Any]) -> dict[str, Any]:
+    fn = call.get("function") or {}
+    raw = fn.get("arguments", call.get("arguments"))
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _step_call_msg(thought: str, name: str, arguments: dict[str, Any], cid: str) -> dict[str, Any]:
+    args_json = json.dumps(arguments, ensure_ascii=False)
+    return {
+        "role": "assistant",
+        "content": thought,
+        "tool_calls": [{
+            "id": cid,
+            "type": "function",
+            "name": name,
+            "arguments": args_json,
+            "function": {"name": name, "arguments": args_json},
+        }],
+    }
+
+
+def _is_full_suite_pytest(command: str) -> bool:
+    cmd = command.strip()
+    if "pytest" not in cmd or "run_pytest_compact.py" in cmd:
+        return False
+    if ".py" in cmd or " -k " in cmd or " -k=" in cmd:
+        return False
+    return True
+
+
+def _trim_prefix_chars(prefix: list[dict[str, Any]], max_chars: int = 36000) -> list[dict[str, Any]]:
+    """Keep `[system, user]` + most recent complete `(assistant, tool...)` groups within `max_chars`."""
+    if len(prefix) <= 2:
+        return prefix
+    trimmed = list(prefix)
+    while len(trimmed) > 2 and sum(len(json.dumps(m, ensure_ascii=False)) for m in trimmed) > max_chars:
+        drop_end = 3
+        while drop_end < len(trimmed) and trimmed[drop_end].get("role") == "tool":
+            drop_end += 1
+        if drop_end >= len(trimmed):
+            break
+        trimmed = trimmed[:2] + trimmed[drop_end:]
+    return trimmed
+
+
+def _extract_chosen_targets(chosen_messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[str], str]:
+    edits: list[dict[str, str]] = []
+    files: list[str] = []
+    pytest_cmd = "python3 skills/swe-guard/scripts/run_pytest_compact.py --query test"
+    for msg in chosen_messages:
+        for call in msg.get("tool_calls") or []:
+            cname = _call_name(call)
+            cargs = _parse_call_args(call)
+            fp = str(cargs.get("filepath") or "").strip()
+            if fp and fp not in files and cname in ("edit_file", "write_file", "read_file"):
+                files.append(fp)
+            if cname == "edit_file" and fp and cargs.get("old_string") and cargs.get("new_string"):
+                edits.append({
+                    "filepath": fp,
+                    "old_string": str(cargs["old_string"]),
+                    "new_string": str(cargs["new_string"]),
+                })
+            elif cname == "run_command":
+                cmd = str(cargs.get("command") or "")
+                if "pytest" in cmd and (".py" in cmd or "run_pytest_compact.py" in cmd):
+                    if "run_pytest_compact.py" in cmd:
+                        pytest_cmd = cmd
+                    else:
+                        # Extract first .py[::node] token for compact runner
+                        for tok in cmd.split():
+                            if ".py" in tok and not tok.startswith("-"):
+                                pytest_cmd = f"python3 skills/swe-guard/scripts/run_pytest_compact.py --target {shlex.quote(tok)}"
+                                break
+    return edits, files, pytest_cmd
+
+
+def build_step_pairs(
+    grouped: dict[str, dict[str, list[dict[str, Any]]]],
+    gold_by_id: dict[str, dict[str, Any]],
+    max_pairs_per_task: int = 4,
+    role: str = "main",
+) -> list[dict[str, Any]]:
+    """Build single-turn Step-DPO pairs (`chosen` and `rejected` each contain 1 assistant turn, 0 tool turns)."""
+    allowed_tools = MAIN_TOOLS if role == "main" else ROLE_TOOLS[role]
+    pairs: list[dict[str, Any]] = []
+
+    for task_id, buckets in sorted(grouped.items()):
+        scored = []
+        for trace in buckets["fail"]:
+            signals = _response_signals(trace["messages"])
+            reason = _rejection_reason(trace, signals)
+            if reason:
+                scored.append((signals["edit_errors"], signals["repeated_calls"],
+                               signals["failed_steps"], reason, trace, signals))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        if not scored:
+            continue
+
+        chosen_pool = [traj for traj in sorted(buckets["ok"], key=_score_trace, reverse=True)
+                       if _usable_as_chosen(traj, role)]
+        source = "self_play"
+        if not chosen_pool and task_id in gold_by_id:
+            chosen_pool = [gold_by_id[task_id]]
+            source = "gold_fallback"
+        if not chosen_pool:
+            continue
+
+        chosen_traj = chosen_pool[0]
+        base_prompt, chosen_resp = _split_prompt_and_response(chosen_traj["messages"])
+        if not chosen_resp:
+            continue
+        chosen_has_action = _requires_code_change(chosen_resp)
+        gold_edits, gold_files, gold_pytest_cmd = _extract_chosen_targets(chosen_resp)
+
+        task_pairs: list[dict[str, Any]] = []
+        seen_sigs: set[str] = set()
+
+        for _, _, _, trace_reason, rej_traj, signals in scored:
+            if len(task_pairs) >= max_pairs_per_task:
+                break
+            msgs = list(rej_traj["messages"])
+            # Ensure `msgs` starts with `[system, user]` from `base_prompt` even if an ATIF trace omitted them
+            first_asst = next((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), len(msgs))
+            prefix_roles = [m.get("role") for m in msgs[:first_asst]]
+            if base_prompt:
+                if "system" not in prefix_roles and "user" not in prefix_roles:
+                    msgs = list(base_prompt) + msgs[first_asst:]
+                elif msgs and msgs[0].get("role") == "system":
+                    msgs = [base_prompt[0]] + msgs[1:]
+                elif "system" not in prefix_roles and base_prompt[0].get("role") == "system":
+                    msgs = [base_prompt[0]] + msgs
+
+            assistant_indices = [i for i, m in enumerate(msgs) if i >= 1 and m.get("role") == "assistant"]
+            last_asst_idx = assistant_indices[-1] if assistant_indices else -1
+            any_edit_ok = False
+            any_submit = False
+            read_by_file: dict[str, list[str]] = defaultdict(list)
+
+            for idx, msg in enumerate(msgs):
+                if msg.get("role") != "assistant":
+                    continue
+                calls = msg.get("tool_calls") or []
+                call0 = calls[0] if calls else {}
+                cname = _call_name(call0) if calls else ""
+                cargs = _parse_call_args(call0) if calls else {}
+                content = str(msg.get("content") or "")
+                next_msg = msgs[idx + 1] if idx + 1 < len(msgs) else None
+                next_obs = str(next_msg.get("content") or "") if (next_msg and next_msg.get("role") == "tool") else ""
+                obs_failed = bool(next_obs) and _observation_failed(next_obs)
+
+                if idx >= 1 and msgs[idx - 1].get("role") in ("user", "tool") and len(task_pairs) < max_pairs_per_task:
+                    chosen_step: dict[str, Any] | None = None
+                    step_reason = ""
+
+                    # 1. Failed edit_file -> teach exact copy from read_file or extract_block.py
+                    if role == "main" and cname == "edit_file" and obs_failed:
+                        fp = str(cargs.get("filepath") or "").strip()
+                        bad_old = str(cargs.get("old_string") or "")
+                        matched_gold = next(
+                            (ge for ge in gold_edits
+                             if ge["filepath"] == fp and ge["old_string"] != bad_old
+                             and any(ge["old_string"] in body for body in read_by_file.get(fp, []))),
+                            None,
+                        )
+                        if matched_gold is not None:
+                            chosen_step = _step_call_msg(
+                                f"Copy the exact verbatim block shown by read_file in {fp} and apply the minimal fix.",
+                                "edit_file",
+                                {"filepath": fp, "old_string": matched_gold["old_string"],
+                                 "new_string": matched_gold["new_string"]},
+                                f"step_{idx}",
+                            )
+                        else:
+                            not_found_path = "source path" in next_obs.lower() or "no such file" in next_obs.lower()
+                            target_fp = (gold_files[0] if (not_found_path or not fp) and gold_files else fp) or "README.md"
+                            ref_old = next((ge["old_string"] for ge in gold_edits if ge["filepath"] == target_fp), bad_old)
+                            query_lines = [ln.strip() for ln in ref_old.splitlines() if ln.strip()]
+                            query = query_lines[0][:60] if query_lines else ""
+                            if query:
+                                cmd = (f"python3 skills/swe-guard/scripts/extract_block.py "
+                                       f"--filepath {shlex.quote(target_fp)} --query {shlex.quote(query)} --context 4")
+                                chosen_step = _step_call_msg(
+                                    f"Extract the exact verbatim block and verify uniqueness in {target_fp} before editing.",
+                                    "run_command", {"command": cmd}, f"step_{idx}",
+                                )
+                            else:
+                                chosen_step = _step_call_msg(
+                                    f"Read {target_fp} first so old_string matches exact file bytes.",
+                                    "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
+                                )
+                        step_reason = "step_edit_error"
+
+                    # 2. Invalid/disabled tool (e.g. apply_patch, verifier, failed skill lookup) or truncated <|tool_call>
+                    elif (
+                        (calls and cname not in allowed_tools)
+                        or (calls and cname in SKILL_META_TOOLS and obs_failed)
+                        or (not calls and "<|tool_call>" in content)
+                    ):
+                        target_fp = str(cargs.get("filepath") or (gold_files[0] if gold_files else ""))
+                        if target_fp:
+                            chosen_step = _step_call_msg(
+                                f"Keep reasoning short and inspect {target_fp} using a declared tool.",
+                                "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
+                            )
+                        elif chosen_resp and chosen_resp[0].get("role") == "assistant":
+                            chosen_step = chosen_resp[0]
+                        step_reason = "step_invalid_tool"
+
+                    # 3. Empty-diff submit_patch when no edit succeeded yet
+                    elif role == "main" and cname == "submit_patch" and chosen_has_action and not any_edit_ok:
+                        target_fp = gold_files[0] if gold_files else ""
+                        if target_fp:
+                            chosen_step = _step_call_msg(
+                                f"No edit_file succeeded yet so git diff is empty; read {target_fp} and apply the fix before submitting.",
+                                "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
+                            )
+                        else:
+                            chosen_step = _step_call_msg(
+                                "Verify non-empty diff with check_patch.py before calling submit_patch.",
+                                "run_command", {"command": "python3 skills/swe-guard/scripts/check_patch.py"}, f"step_{idx}",
+                            )
+                        step_reason = "step_empty_submit"
+
+                    # 4. Full-suite pytest (`pytest tests/`) instead of targeted test
+                    elif role == "main" and cname == "run_command" and _is_full_suite_pytest(str(cargs.get("command") or "")):
+                        chosen_step = _step_call_msg(
+                            "Run only the targeted test file with run_pytest_compact.py instead of the entire suite.",
+                            "run_command", {"command": gold_pytest_cmd}, f"step_{idx}",
+                        )
+                        step_reason = "step_full_pytest"
+
+                    # 5. Premature text stop / wrong NO_PATCH without submit_patch
+                    elif role == "main" and idx == last_asst_idx and not calls and not any_submit:
+                        if chosen_has_action or not _ends_with_no_patch([msg]):
+                            if any_edit_ok:
+                                chosen_step = _step_call_msg(
+                                    "Run check_patch.py and submit_patch instead of stopping without submitting.",
+                                    "run_command", {"command": "python3 skills/swe-guard/scripts/check_patch.py"}, f"step_{idx}",
+                                )
+                            elif gold_files:
+                                chosen_step = _step_call_msg(
+                                    f"Inspect {gold_files[0]} with read_file instead of stopping without a patch.",
+                                    "read_file", {"filepath": gold_files[0], "start_line": 1, "end_line": 120}, f"step_{idx}",
+                                )
+                            step_reason = "step_premature_stop"
+
+                    if chosen_step is not None:
+                        sig = f"{step_reason}:{_call_signature(call0) if calls else content[:120]}"
+                        if sig not in seen_sigs:
+                            seen_sigs.add(sig)
+                            prefix = _trim_prefix_chars(msgs[:idx])
+                            task_pairs.append({
+                                "prompt": prefix,
+                                "chosen": [chosen_step],
+                                "rejected": [msg],
+                                "meta": {
+                                    "instance_id": task_id,
+                                    "source": source,
+                                    "mode": "step",
+                                    "rejection_reason": step_reason,
+                                    "trace_reason": trace_reason,
+                                    "step_index": idx,
+                                    **signals,
+                                },
+                            })
+
+                # Update state after inspecting turn `idx`
+                if cname == "read_file" and not obs_failed and next_obs:
+                    try:
+                        payload = json.loads(next_obs)
+                        fp_read = str(cargs.get("filepath") or payload.get("filepath") or "")
+                        if fp_read:
+                            read_by_file[fp_read].append(str(payload.get("content") or ""))
+                    except json.JSONDecodeError:
+                        pass
+                elif cname in EDIT_CALLS and next_obs and not obs_failed:
+                    any_edit_ok = True
+                elif cname == "submit_patch":
+                    any_submit = True
+
+            # Fallback: if no specific bad step matched on this failed trace, pair first divergent turn
+            if not task_pairs and assistant_indices and chosen_resp and chosen_resp[0].get("role") == "assistant":
+                first_rej = msgs[assistant_indices[0]]
+                first_chosen = chosen_resp[0]
+                rej_calls = first_rej.get("tool_calls") or []
+                cho_calls = first_chosen.get("tool_calls") or []
+                rej_sig = _call_signature(rej_calls[0]) if rej_calls else str(first_rej.get("content") or "")[:120]
+                cho_sig = _call_signature(cho_calls[0]) if cho_calls else str(first_chosen.get("content") or "")[:120]
+                if rej_sig != cho_sig:
+                    task_pairs.append({
+                        "prompt": _trim_prefix_chars(msgs[:assistant_indices[0]]),
+                        "chosen": [first_chosen],
+                        "rejected": [first_rej],
+                        "meta": {
+                            "instance_id": task_id,
+                            "source": source,
+                            "mode": "step",
+                            "rejection_reason": f"step_first_turn_{trace_reason}",
+                            "trace_reason": trace_reason,
+                            "step_index": assistant_indices[0],
+                            **signals,
+                        },
+                    })
+
+        pairs.extend(task_pairs[:max_pairs_per_task])
+    return pairs
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Build DPO preference pairs from eval traces")
     p.add_argument("--results", nargs="+", required=True, help="one or more results/ or traces/ directories")
@@ -431,7 +763,10 @@ def main() -> int:
     p.add_argument("--task-results", default=None,
                    help=f"override the {TASK_RESULTS_NAME} used for resolved / patch size "
                         "(default: look for it in --results and one level up)")
-    p.add_argument("--max-pairs-per-task", type=int, default=2)
+    p.add_argument("--max-pairs-per-task", type=int, default=4)
+    p.add_argument("--mode", choices=["step", "trajectory", "both"], default="step",
+                   help="step (default): 1-turn Step-DPO pairs without tool observation noise; "
+                        "trajectory: full multi-turn completion pairs; both: combine both")
     p.add_argument("--output", default=None,
                    help="output jsonl (default: data/dpo_pairs.jsonl, data/dpo_pairs_<role>.jsonl "
                         "for analyzer / verifier)")
@@ -441,11 +776,19 @@ def main() -> int:
     task_results_file = Path(args.task_results) if args.task_results else None
     grouped = _load_traces(results_dirs, args.role, task_results_file)
     gold = _load_gold_trajectories(Path(args.tasks), args.role, args.system_prompt)
-    pairs = build_pairs(grouped, gold, max_pairs_per_task=args.max_pairs_per_task, role=args.role)
+    pairs: list[dict[str, Any]] = []
+    if args.mode in ("step", "both"):
+        pairs.extend(build_step_pairs(grouped, gold, max_pairs_per_task=args.max_pairs_per_task, role=args.role))
+    if args.mode in ("trajectory", "both"):
+        pairs.extend(build_pairs(grouped, gold, max_pairs_per_task=min(2, args.max_pairs_per_task), role=args.role))
 
     roots = [root for root in results_dirs if root.exists()]
     resolved = sum(1 for bucket in grouped.values() for traj in bucket["ok"])
-    joined = sum(1 for root in roots if _task_results_file(root, task_results_file))
+    joined = sum(
+        1 for root in roots
+        if _task_results_file(root, task_results_file)
+        or (task_results_file is None and any(root.rglob(TASK_RESULTS_NAME)))
+    )
     print(f"[dpo-data] {TASK_RESULTS_NAME}: joined for {joined}/{len(roots)} result dir(s), "
           f"traces_with_resolved_true={resolved}")
     if roots and not joined:

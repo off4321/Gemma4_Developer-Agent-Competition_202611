@@ -33,6 +33,10 @@ Run these with `run_command` from the repo root, so paths like `fastapi/routing.
    BLOCKED means only protected paths (`tests/`, `test_*.py`, `conftest.py`, `pyproject.toml`, ...)
    were touched - the patch would strip to 0 B - or a modified `.py` does not parse, which fails
    every test with `exit 2`.
+4. **`safe_edit.py`** - line-range fallback when `edit_file` fails twice with `old_string not found`:
+   inspect numbered lines with `extract_block.py --filepath <path> --start N --end M`, then run
+   `python3 skills/swe-guard/scripts/safe_edit.py --filepath <path> --start N --end M --stdin << 'EOF'`.
+   Refuses protected test/config paths and automatically rolls back `.py` edits on `SyntaxError`.
 
 This skill is a set of scripts, not a sub-agent: `code_analyzer` is a sub-agent and is called as a
 tool, and neither `code_analyzer` nor `verifier` can be loaded with `load_skill`.

@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
 
     # DPO & optimisation
     p.add_argument("--beta", type=float, default=0.1, help="DPO KL penalty coefficient")
+    p.add_argument("--loss_types", default="sigmoid_norm,sft",
+                   help="comma-separated trl DPO loss types (default: sigmoid_norm,sft for MPO/RPO anchoring)")
+    p.add_argument("--loss_weights", default="1.0,0.5",
+                   help="comma-separated weights matching --loss_types (default: 1.0,0.5)")
     p.add_argument("--max_len", type=int, default=8192)
     p.add_argument("--max_prompt_len", type=int, default=None,
                    help="prompt token cap (default: max_len // 2)")
@@ -75,11 +79,43 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _trim_prompt_messages(
+    tokenizer: AutoTokenizer,
+    prompt_msgs: list[dict[str, Any]],
+    chosen_text: str,
+    rejected_text: str,
+    max_len: int,
+) -> list[dict[str, Any]]:
+    """Drop oldest middle turns from `prompt_msgs[2:]` so `trl`'s `keep_start` never cuts completions."""
+    if max_len <= 0 or len(prompt_msgs) <= 2 or not hasattr(tokenizer, "encode"):
+        return prompt_msgs
+    try:
+        comp_tokens = max(
+            len(tokenizer.encode(chosen_text, add_special_tokens=False)),
+            len(tokenizer.encode(rejected_text, add_special_tokens=False)),
+        )
+        budget = max(512, max_len - comp_tokens - 32)
+        trimmed = list(prompt_msgs)
+        while len(trimmed) > 2:
+            rendered = tokenizer.apply_chat_template(trimmed, add_generation_prompt=True, tokenize=False)
+            if len(tokenizer.encode(rendered, add_special_tokens=False)) <= budget:
+                break
+            # Drop one assistant turn and its immediately following tool observations after [system, user]
+            drop_end = 3
+            while drop_end < len(trimmed) and trimmed[drop_end].get("role") == "tool":
+                drop_end += 1
+            trimmed = trimmed[:2] + trimmed[drop_end:]
+        return trimmed
+    except Exception:
+        return prompt_msgs
+
+
 def _render_pair_texts(
     tokenizer: AutoTokenizer,
     prompt_msgs: list[dict[str, Any]],
     chosen_msgs: list[dict[str, Any]],
     rejected_msgs: list[dict[str, Any]],
+    max_len: int = 0,
 ) -> tuple[str, str, str]:
     """Render (prompt, chosen, rejected) using full-conversation `apply_chat_template`."""
     norm_prompt = [_normalize_tool_calls(m) for m in prompt_msgs]
@@ -94,7 +130,12 @@ def _render_pair_texts(
             norm_prompt + norm_rejected, add_generation_prompt=False, tokenize=False
         )
         if chosen_full.startswith(prompt_text) and rejected_full.startswith(prompt_text):
-            return prompt_text, chosen_full[len(prompt_text):], rejected_full[len(prompt_text):]
+            c_slice = chosen_full[len(prompt_text):]
+            r_slice = rejected_full[len(prompt_text):]
+            trimmed_prompt = _trim_prompt_messages(tokenizer, norm_prompt, c_slice, r_slice, max_len)
+            if len(trimmed_prompt) != len(norm_prompt):
+                prompt_text = tokenizer.apply_chat_template(trimmed_prompt, add_generation_prompt=True, tokenize=False)
+            return prompt_text, c_slice, r_slice
         base_text = tokenizer.apply_chat_template(norm_prompt, add_generation_prompt=False, tokenize=False)
         if chosen_full.startswith(base_text) and rejected_full.startswith(base_text):
             return base_text, chosen_full[len(base_text):], rejected_full[len(base_text):]
@@ -107,7 +148,7 @@ def _render_pair_texts(
     )
 
 
-def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int) -> Dataset:
+def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int, max_len: int = 0) -> Dataset:
     data_path = Path(path)
     if not data_path.is_file():
         raise SystemExit(f"[error] DPO data not found: {path} (run src/collect/build_dpo_pairs.py first)")
@@ -122,6 +163,7 @@ def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int) -> 
             item.get("prompt") or [],
             item.get("chosen") or [],
             item.get("rejected") or [],
+            max_len=max_len,
         )
         if prompt and chosen and rejected:
             rows.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
@@ -145,7 +187,7 @@ def main() -> int:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = load_dpo_dataset(args.data, tokenizer, args.max_examples)
+    dataset = load_dpo_dataset(args.data, tokenizer, args.max_examples, max_len=args.max_len)
     model = load_base(args, model_path)
     if args.resume_from is None:
         model = get_peft_model(model, build_lora_config(args, model))
@@ -189,6 +231,15 @@ def main() -> int:
         dpo_kwargs["warmup_ratio"] = args.warmup_ratio
     elif "warmup_steps" in dpo_fields:
         dpo_kwargs["warmup_steps"] = max(1, int(total_steps * args.warmup_ratio))
+    loss_types = [t.strip() for t in str(args.loss_types).split(",") if t.strip()]
+    loss_weights = [float(w.strip()) for w in str(args.loss_weights).split(",") if w.strip()]
+    if loss_types and "loss_type" in dpo_fields:
+        if "loss_weights" in dpo_fields and len(loss_types) > 1:
+            dpo_kwargs["loss_type"] = loss_types
+            if len(loss_weights) == len(loss_types):
+                dpo_kwargs["loss_weights"] = loss_weights
+        else:
+            dpo_kwargs["loss_type"] = loss_types[0]
 
     dpo_args = DPOConfig(**{k: v for k, v in dpo_kwargs.items() if k in dpo_fields})
     optimizer = build_optimizer(model, args)

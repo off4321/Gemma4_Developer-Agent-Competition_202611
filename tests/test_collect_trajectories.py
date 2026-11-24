@@ -153,3 +153,22 @@ def test_read_observation_keeps_the_string_the_edit_needs() -> None:
     kept = collect.read_observation("pkg/a.py", 1, 200, body, include=tail)
     assert kept["truncated"] is False
     assert tail in kept["content"]
+
+
+def test_recovery_trajectory_teaches_extract_block_and_swe_guard() -> None:
+    record = collect.build_recovery_trajectory(
+        two_hunk_task(), SYSTEM_PROMPT, BUDGET, True, 6, collect.DEFAULT_MAX_HUNK_LINES
+    )
+    assert record is not None
+    assert record["meta"]["source"] == "gold_recovery"
+    calls = [
+        (c["function"]["name"], json.loads(c["function"]["arguments"]))
+        for m in record["messages"] for c in (m.get("tool_calls") or [])
+    ]
+    names = [n for n, _ in calls]
+    # First edit fails, then run_command calls extract_block.py, then exact edit_file succeeds
+    assert names.count("edit_file") == 3
+    run_cmds = [a["command"] for n, a in calls if n == "run_command"]
+    assert any("extract_block.py" in cmd for cmd in run_cmds)
+    assert any("run_pytest_compact.py" in cmd for cmd in run_cmds)
+    assert any("check_patch.py" in cmd for cmd in run_cmds)

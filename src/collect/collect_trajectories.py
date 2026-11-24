@@ -425,6 +425,164 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
     }
 
 
+def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str, Any],
+                              native_tools: bool, max_edits: int, max_hunk_lines: int) -> dict[str, Any] | None:
+    """1-step error-recovery SFT trajectory (`FileEditError` -> `extract_block.py` -> exact `edit_file` -> `swe-guard` verify).
+
+    Happy-path-only SFT leaves the model out-of-distribution the first time `edit_file` returns
+    `old_string not found`, causing repeated blind retries. This teaches the exact recovery loop:
+    use `extract_block.py` to get the verbatim unique block, apply `edit_file`, verify with
+    `run_pytest_compact.py` + `check_patch.py`, and call `submit_patch`.
+    """
+    import shlex
+
+    sections = [s for s in parse_diff(task.get("patch") or "") if not protected_file(s["path"])]
+    if not sections:
+        return None
+    edits: list[dict[str, Any]] = []
+    for section in sections:
+        edits.extend(edits_for_file(section, max_hunk_lines))
+    edit_only = [e for e in edits if e["kind"] == "edit_file" and len(e["old_string"].splitlines()) >= 2]
+    if not edits or len(edits) > max_edits or not edit_only:
+        return None
+
+    targets = pytest_targets(task.get("test_patch") or "")
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": initial_user_prompt(
+            task.get("problem_statement") or task.get("hints_text") or "", task["repo"], budget)},
+    ]
+
+    call_index = 0
+    files_changed = {e["filepath"] for e in edits}
+    read_contents: dict[str, list[str]] = {}
+    recovered_first = False
+
+    for edit in edits:
+        filepath = edit["filepath"]
+        if edit["kind"] == "write_file":
+            call_index += 1
+            append_call(messages, call_index,
+                        f"Write the required file {filepath}.",
+                        {"name": "write_file", "arguments": {"filepath": filepath, "content": edit["content"]}},
+                        {"status": "ok", "filepath": filepath, "size": len(edit["content"])},
+                        native_tools)
+            continue
+
+        start_line = int(edit.get("start_line") or 1)
+        end_line = max(int(edit.get("end_line") or start_line), start_line)
+        old_str = str(edit["old_string"])
+        new_str = str(edit["new_string"])
+
+        if not recovered_first:
+            recovered_first = True
+            # 1) Initial read_file near the region, followed by a slightly mis-indented edit_file that fails
+            bad_old = "\n".join(line.lstrip(" ") if idx == 0 else line
+                                for idx, line in enumerate(old_str.splitlines()))
+            if bad_old == old_str:
+                bad_old = old_str.rstrip() + "\n    # stale context"
+            obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
+            read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
+            call_index += 1
+            append_call(messages, call_index,
+                        f"Read {filepath}:{start_line}-{end_line} to inspect the target logic.",
+                        {"name": "read_file", "arguments": {
+                            "filepath": filepath, "start_line": start_line, "end_line": end_line}},
+                        obs_read, native_tools)
+
+            call_index += 1
+            append_call(messages, call_index,
+                        f"Attempt minimal fix in {filepath}.",
+                        {"name": "edit_file", "arguments": {
+                            "filepath": filepath, "old_string": bad_old, "new_string": new_str}},
+                        {"status": "error", "error_type": "FileEditError",
+                         "error_message": "Failed to replace: old_string not found. Ensure your old_string matches the exact file content including indentation."},
+                        native_tools)
+
+            # 2) Recovery via extract_block.py -> verbatim block + UNIQUE: yes -> exact edit_file succeeds
+            non_empty = [ln.strip() for ln in old_str.splitlines() if ln.strip()]
+            query = non_empty[0][:60] if non_empty else filepath
+            extract_cmd = (f"python3 skills/swe-guard/scripts/extract_block.py "
+                           f"--filepath {shlex.quote(filepath)} --query {shlex.quote(query)} --context 3")
+            extract_stdout = (f"FILE: {filepath} (lines {start_line}..{end_line})\n"
+                              f"UNIQUE: yes\n>>> BLOCK\n{old_str}\n<<<\n")
+            call_index += 1
+            append_call(messages, call_index,
+                        f"old_string did not match exact indentation in {filepath}. Run extract_block.py to obtain the exact verbatim block instead of guessing.",
+                        {"name": "run_command", "arguments": {"command": extract_cmd}},
+                        {"status": "ok", "stdout": extract_stdout, "stderr": "", "exit_code": 0},
+                        native_tools)
+
+            call_index += 1
+            append_call(messages, call_index,
+                        f"Paste the exact block from extract_block.py into edit_file for {filepath}.",
+                        {"name": "edit_file", "arguments": {
+                            "filepath": filepath, "old_string": old_str, "new_string": new_str}},
+                        {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
+                         "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                        native_tools)
+        else:
+            if not read_covers(read_contents, filepath, old_str):
+                obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
+                read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Read {filepath}:{start_line}-{end_line} before applying the next hunk.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": start_line, "end_line": end_line}},
+                            obs_read, native_tools)
+            call_index += 1
+            append_call(messages, call_index,
+                        f"Apply the remaining change in {filepath}.",
+                        {"name": "edit_file", "arguments": {
+                            "filepath": filepath, "old_string": old_str, "new_string": new_str}},
+                        {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
+                         "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                        native_tools)
+
+    compact_cmd = (f"python3 skills/swe-guard/scripts/run_pytest_compact.py --target {shlex.quote(targets[0])}"
+                   if targets else "python3 skills/swe-guard/scripts/run_pytest_compact.py --query test")
+    call_index += 1
+    append_call(messages, call_index,
+                "Run the targeted test via run_pytest_compact.py without executing the full test suite.",
+                {"name": "run_command", "arguments": {"command": compact_cmd}},
+                {"status": "ok", "stdout": "EXIT: 0\n1 passed in 0.42s", "stderr": "", "exit_code": 0},
+                native_tools)
+
+    call_index += 1
+    append_call(messages, call_index,
+                "Check syntax, protected paths, and non-empty diff with check_patch.py before submitting.",
+                {"name": "run_command", "arguments": {"command": "python3 skills/swe-guard/scripts/check_patch.py"}},
+                {"status": "ok", "stdout": f"KEPT_FILES: {sorted(files_changed)}\nSTATUS: READY_FOR_SUBMIT",
+                 "stderr": "", "exit_code": 0},
+                native_tools)
+
+    call_index += 1
+    append_call(messages, call_index,
+                "Patch verified and READY_FOR_SUBMIT; call submit_patch.",
+                {"name": "submit_patch", "arguments": {}},
+                {"status": "ok", "patch_size": len(task.get("patch") or ""),
+                 "files_changed": len(files_changed)},
+                native_tools)
+    messages.append({"role": "assistant",
+                     "content": "Recovered exact edit block, verified targeted tests and patch hygiene, and submitted."})
+
+    return {
+        "messages": messages,
+        "meta": {
+            "instance_id": f"{task['instance_id']}__recovery",
+            "repo": task["repo"],
+            "base_commit": task.get("base_commit"),
+            "n_edits": len(edits),
+            "files_changed": sorted(files_changed),
+            "pytest_targets": targets,
+            **_io_summary(messages),
+            "test_status": "passed",
+            "source": "gold_recovery",
+        },
+    }
+
+
 def hunk_line_range_pair(hunk: dict[str, Any]) -> tuple[int, int]:
     """gold hunk 1 件を (start, end) の 1-indexed 行 range にする（`read_file` の target 範囲用）。"""
     body = hunk["body"]
@@ -1282,6 +1440,9 @@ def main() -> int:
     parser.add_argument("--no-patch-examples", type=int, default=8,
                         help="role=main のとき、原因が repo の外の設定にある failure を NO_PATCH で "
                              "終わる教材をこの件数だけ足す（0 で無効）")
+    parser.add_argument("--recovery-examples", type=int, default=24,
+                        help="role=main のとき、FileEditError -> extract_block.py -> edit_file 成功 "
+                             "-> swe-guard 検証の回復教材をこの件数だけ足す（0 で無効）")
     args = parser.parse_args()
 
     tasks_path = Path(args.tasks)
@@ -1327,19 +1488,66 @@ def main() -> int:
                 added += 1
         print(f"[collect] NO_PATCH 教材を {added} 件追加（final answer = NO_PATCH の設定系）")
 
+    if args.role == "main" and args.recovery_examples > 0:
+        rec_added = 0
+        for task in task_cache:
+            if rec_added >= args.recovery_examples:
+                break
+            cand = build_recovery_trajectory(task, system_prompt, budget, args.native_tools,
+                                             args.max_edits, args.max_hunk_lines)
+            if cand:
+                records.append(cand)
+                rec_added += 1
+        print(f"[collect] Recovery 教材を {rec_added} 件追加（FileEditError -> extract_block.py -> edit_file）")
+
     if args.import_traces:
         traces_dir = Path(args.import_traces)
-        candidates = list(traces_dir.rglob("trace_*.json")) or list(traces_dir.rglob("*.json"))
+        candidates = sorted(traces_dir.rglob("trace_*.json")) or sorted(traces_dir.rglob("*.json"))
+        # Join task_results.jsonl per directory so ATIF traces know their true resolved & patch_size
+        tr_cache: dict[Path, dict[str, dict[str, Any]]] = {}
+
+        def _lookup_task_result(trace_path: Path, iid: str) -> dict[str, Any]:
+            for parent in (trace_path.parent, trace_path.parent.parent):
+                tr_file = parent / "task_results.jsonl"
+                if tr_file.is_file():
+                    if tr_file not in tr_cache:
+                        idx_map: dict[str, dict[str, Any]] = {}
+                        for ln in tr_file.read_text(encoding="utf-8").splitlines():
+                            if not ln.strip():
+                                continue
+                            try:
+                                row = json.loads(ln)
+                                key = str(row.get("instance_id") or row.get("task_id") or "").strip()
+                                if key:
+                                    idx_map[key] = row
+                            except json.JSONDecodeError:
+                                continue
+                        tr_cache[tr_file] = idx_map
+                    if iid in tr_cache[tr_file]:
+                        return tr_cache[tr_file][iid]
+            return {}
+
         imported = skipped_role = 0
         for path in candidates:
+            if path.name == "task_results.jsonl" or path.name == "summary.json":
+                continue
             traj = normalize_trace(path)
             if not traj:
                 continue
             if not _role_matches(traj, args.role):
                 skipped_role += 1        # an edit_file / submit_patch trace is not analyzer material
                 continue
-            if args.only_resolved and traj["meta"].get("resolved") is not True:
-                continue
+            iid = str(traj.get("meta", {}).get("instance_id") or path.stem).removeprefix("trace_")
+            tr_row = _lookup_task_result(path, iid)
+            if isinstance(tr_row.get("resolved"), bool):
+                traj.setdefault("meta", {})["resolved"] = tr_row["resolved"]
+            if "agent_patch_size" in tr_row and tr_row["agent_patch_size"] is not None:
+                traj.setdefault("meta", {})["agent_patch_size"] = tr_row["agent_patch_size"]
+            if args.only_resolved:
+                if traj["meta"].get("resolved") is not True:
+                    continue
+                if args.role == "main" and traj["meta"].get("agent_patch_size") == 0:
+                    continue
             records.append(traj)
             imported += 1
         print(f"[collect] imported {imported} harness traces from {traces_dir}"

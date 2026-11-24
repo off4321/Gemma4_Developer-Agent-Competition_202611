@@ -14,6 +14,7 @@ top_p: 0.95
 max_output_tokens: 8192
 thinking_config:
   thinking_budget: 1536
-  include_thoughts: true        # main / analyzer need the thought step to keep tool-call chains
-                                # (the verifier keeps it false: configs/verifier_sampling.yaml)
+  include_thoughts: false       # HARNESS_README §2.4: thinking_budget > 0 still enables reasoning
+                                # on every turn, while false strips prior turns' `<|channel>thought`
+                                # from history (prevents self-conditioning hallucinations & 32k bloat)
   # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm

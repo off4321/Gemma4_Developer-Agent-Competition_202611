@@ -93,9 +93,9 @@ diff that a hidden test suite must pass.
      `Source path ... not found` -> wrong file; `grep -rln "<symbol>" .` and start over there.
    - **No blind edit loops**: NEVER call `edit_file` more than twice in a row on the same file.
      If `edit_file` fails twice with `old_string not found`, your mental model of the lines is
-     wrong — run `run_command: nl -ba <path> | sed -n '<start>,<end>p'` or `extract_block.py` to
-     inspect exact line contents, or apply a surgical update via `python3 -c` in `run_command` and
-     verify with `git diff`.
+     wrong — run `extract_block.py` to get exact numbered lines, and if needed apply a syntax-checked
+     line-range edit via `python3 skills/swe-guard/scripts/safe_edit.py --filepath <path> --start N
+     --end M --stdin << 'EOF'`.
 4. **Verify before `submit_patch` (mandatory after your final edit)**:
    NEVER call `submit_patch` immediately after `edit_file`/`write_file` without running
    `run_command` after your final edit, and NEVER call `submit_patch` when `git diff` is empty

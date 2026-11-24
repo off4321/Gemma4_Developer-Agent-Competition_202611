@@ -200,3 +200,27 @@ def test_edit_heavy_trace_is_preferred_as_the_rejected_example(tmp_path: Path) -
     meta = pairs[0]["meta"]
     assert meta["rejection_reason"] == "edit_file_repeat"
     assert meta["edit_errors"] == 2, "the 2x edit_file failure outranks the grep-only failure"
+
+
+def test_step_pairs_contain_single_assistant_turn_without_tool_observations(tmp_path: Path) -> None:
+    bad_steps = [
+        step("read", [call("read_file", {"filepath": "pkg/a.py"}, "r1")],
+             {"status": "ok", "filepath": "pkg/a.py", "content": "def f():\n    x = 1\n"}),
+        step("hallucinated edit", [call("edit_file", {**EDIT_ARGS, "old_string": "self.x = 1"}, "b1")], EDIT_MISS),
+        step("invented tool", [call("apply_patch", {"filepath": "pkg/a.py"}, "b2")], OK),
+        step("full pytest", [call("run_command", {"command": "python3 -m pytest tests/ -q"}, "b3")], OK),
+        step("empty submit", [call("submit_patch", {}, "b4")], {"status": "ok", "patch_size": 0, "files_changed": 0}),
+    ]
+    write_trace(tmp_path, "rich_step", "a", bad_steps)
+    write_task_results(tmp_path, [{"instance_id": "rich_step", "resolved": False, "agent_patch_size": 0}])
+    grouped = dpo._load_traces([tmp_path], "main")
+    step_pairs = dpo.build_step_pairs(grouped, {"rich_step": gold()}, max_pairs_per_task=6)
+    assert len(step_pairs) == 4
+    reasons = [p["meta"]["rejection_reason"] for p in step_pairs]
+    assert reasons == ["step_edit_error", "step_invalid_tool", "step_full_pytest", "step_empty_submit"]
+    for p in step_pairs:
+        assert len(p["chosen"]) == 1 and p["chosen"][0]["role"] == "assistant"
+        assert len(p["rejected"]) == 1 and p["rejected"][0]["role"] == "assistant"
+        assert p["prompt"][-1]["role"] in ("user", "tool")
+    # Because read_file already contained EDIT_ARGS["old_string"], step_edit_error teaches the exact gold edit_file
+    assert step_pairs[0]["chosen"][0]["tool_calls"][0]["function"]["name"] == "edit_file"
