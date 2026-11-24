@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from train.train_lora import (  # noqa: E402
+    _normalize_tool_calls,
     build_lora_config,
     build_optimizer,
     load_base,
@@ -52,12 +53,12 @@ def parse_args() -> argparse.Namespace:
 
     # DPO & optimisation
     p.add_argument("--beta", type=float, default=0.1, help="DPO KL penalty coefficient")
-    p.add_argument("--max_len", type=int, default=4096)
-    p.add_argument("--max_prompt_len", type=int, default=1536)
+    p.add_argument("--max_len", type=int, default=8192)
+    p.add_argument("--max_prompt_len", type=int, default=3584)
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=5e-6)
+    p.add_argument("--lr", type=float, default=2e-6)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"])
@@ -68,8 +69,36 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _render_turns(tokenizer: AutoTokenizer, messages: list[dict[str, Any]]) -> str:
-    return "".join(render_message(tokenizer, msg) for msg in messages)
+def _render_pair_texts(
+    tokenizer: AutoTokenizer,
+    prompt_msgs: list[dict[str, Any]],
+    chosen_msgs: list[dict[str, Any]],
+    rejected_msgs: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    """Render (prompt, chosen, rejected) using full-conversation `apply_chat_template`."""
+    norm_prompt = [_normalize_tool_calls(m) for m in prompt_msgs]
+    norm_chosen = [_normalize_tool_calls(m) for m in chosen_msgs]
+    norm_rejected = [_normalize_tool_calls(m) for m in rejected_msgs]
+    try:
+        prompt_text = tokenizer.apply_chat_template(norm_prompt, add_generation_prompt=True, tokenize=False)
+        chosen_full = tokenizer.apply_chat_template(
+            norm_prompt + norm_chosen, add_generation_prompt=False, tokenize=False
+        )
+        rejected_full = tokenizer.apply_chat_template(
+            norm_prompt + norm_rejected, add_generation_prompt=False, tokenize=False
+        )
+        if chosen_full.startswith(prompt_text) and rejected_full.startswith(prompt_text):
+            return prompt_text, chosen_full[len(prompt_text):], rejected_full[len(prompt_text):]
+        base_text = tokenizer.apply_chat_template(norm_prompt, add_generation_prompt=False, tokenize=False)
+        if chosen_full.startswith(base_text) and rejected_full.startswith(base_text):
+            return base_text, chosen_full[len(base_text):], rejected_full[len(base_text):]
+    except Exception:
+        pass
+    return (
+        "".join(render_message(tokenizer, m) for m in norm_prompt),
+        "".join(render_message(tokenizer, m) for m in norm_chosen),
+        "".join(render_message(tokenizer, m) for m in norm_rejected),
+    )
 
 
 def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int) -> Dataset:
@@ -82,9 +111,12 @@ def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int) -> 
         if not line.strip():
             continue
         item = json.loads(line)
-        prompt = _render_turns(tokenizer, item.get("prompt") or [])
-        chosen = _render_turns(tokenizer, item.get("chosen") or [])
-        rejected = _render_turns(tokenizer, item.get("rejected") or [])
+        prompt, chosen, rejected = _render_pair_texts(
+            tokenizer,
+            item.get("prompt") or [],
+            item.get("chosen") or [],
+            item.get("rejected") or [],
+        )
         if prompt and chosen and rejected:
             rows.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
         if max_examples and len(rows) >= max_examples:
@@ -93,6 +125,7 @@ def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int) -> 
     if not rows:
         raise SystemExit(f"[error] no usable preference pairs in {path}")
     print(f"[dpo] loaded {len(rows)} preference pairs from {path}")
+    print(f"[dpo] sample chosen[:220]: {rows[0]['chosen'][:220]!r}")
     return Dataset.from_list(rows)
 
 
