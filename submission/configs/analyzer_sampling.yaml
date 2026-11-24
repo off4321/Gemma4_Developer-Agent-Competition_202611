@@ -1,0 +1,11 @@
+# Generation config for the `code_analyzer` sub-agent only (configs/sampling.yaml is the root's).
+# Low temperature + a small deterministic thinking budget: the report is a lookup result, so
+# creativity here only shows up as invented file/line refs.
+temperature: 0.1
+top_p: 0.9
+max_output_tokens: 2048         # a 3-section report + 2 quoted snippets fits with room to spare
+thinking_config:
+  thinking_budget: 1024         # half the root's budget: narrowing candidates is not multi-step work
+  include_thoughts: true        # the reasoning must stay in the sub-agent's own context, and
+                                # `skip_summarization: true` returns only the final message, so the
+                                # root never pays for it

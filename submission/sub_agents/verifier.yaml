@@ -13,7 +13,10 @@ tools:
   - read_file
   - get_status
 model: gemma-4-e4b-it-qat-w4a16-ct
-adapter: verifier_lora                    # uncomment only after adapters/verifier_lora/ exists
+# 2026-11-24: verifier 自体を無効化したので adapter も外す（agent.yaml の agent_tool entry が
+# コメント中のため、この file は今どこからも参照されていない）。再度有効にする時は
+# adapters/verifier_lora/ が提出先にあることを確認してからこの行を戻す。
+# adapter: verifier_lora   # re-enable together with the agent_tool entry in ../agent.yaml
 instruction: !include ../prompts/verifier.md
 # ADK `generate_config` (max_tokens / max_thoughts) is NOT accepted here: this harness wants
 # `generate_content_config` with `max_output_tokens: 1024` and

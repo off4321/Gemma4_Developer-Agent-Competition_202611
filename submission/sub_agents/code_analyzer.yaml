@@ -19,4 +19,9 @@ tools:
   - search_similar_code
   - get_code_neighbors
   - get_code_subgraph
-generate_content_config: !include ../configs/sampling.yaml
+generate_content_config: !include ../configs/analyzer_sampling.yaml
+# ↑ 2026-11-24: root と共有していた configs/sampling.yaml (temperature 0.6 / thinking 2048) から
+# 分離。0.6 の sampling は exploration の grep 語を毎回入れ替えて、未確認の path を「あります」と
+# 報告する幻覚（read_file 失敗 124 件 / 489 件、search_similar_code 失敗 14/25）を増やしていた。
+# analyzer は lookup が仕事なので低温・小 budget にする（詳細: configs/analyzer_sampling.yaml）。
+
