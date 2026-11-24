@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+adapters_out
+result/
 
 # staging created by `make push-code` / `make push-submission`
 .kaggle/dataset-code/src/
@@ -10,6 +12,7 @@ __pycache__/
 .kaggle/dataset-submission/configs/
 .kaggle/dataset-submission/sub_agents/
 .kaggle/dataset-submission/adapters/
+.kaggle/dataset-submission-zip/
 
 # bulky data pulled from Kaggle / produced by runs
 data/*.jsonl

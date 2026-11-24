@@ -499,23 +499,21 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
                          "error_message": "Failed to replace: old_string not found. Ensure your old_string matches the exact file content including indentation."},
                         native_tools)
 
-            # 2) Recovery via extract_block.py -> verbatim block + UNIQUE: yes -> exact edit_file succeeds
-            non_empty = [ln.strip() for ln in old_str.splitlines() if ln.strip()]
-            query = non_empty[0][:60] if non_empty else filepath
-            extract_cmd = (f"python3 skills/swe-guard/scripts/extract_block.py "
-                           f"--filepath {shlex.quote(filepath)} --query {shlex.quote(query)} --context 3")
-            extract_stdout = (f"FILE: {filepath} (lines {start_line}..{end_line})\n"
-                              f"UNIQUE: yes\n>>> BLOCK\n{old_str}\n<<<\n")
+            # 2) Recovery via read_file on exact range -> verbatim block -> exact edit_file succeeds
+            re_start = max(1, start_line - 3)
+            re_end = end_line + 3
+            obs_reread = read_observation(filepath, re_start, re_end, old_str, include=old_str)
             call_index += 1
             append_call(messages, call_index,
-                        f"old_string did not match exact indentation in {filepath}. Run extract_block.py to obtain the exact verbatim block instead of guessing.",
-                        {"name": "run_command", "arguments": {"command": extract_cmd}},
-                        {"status": "ok", "stdout": extract_stdout, "stderr": "", "exit_code": 0},
+                        f"old_string did not match exact indentation in {filepath}. Re-read lines {re_start}-{re_end} with read_file and copy the verbatim block.",
+                        {"name": "read_file", "arguments": {
+                            "filepath": filepath, "start_line": re_start, "end_line": re_end}},
+                        obs_reread,
                         native_tools)
 
             call_index += 1
             append_call(messages, call_index,
-                        f"Paste the exact block from extract_block.py into edit_file for {filepath}.",
+                        f"Copy the exact verbatim block from read_file into edit_file for {filepath}.",
                         {"name": "edit_file", "arguments": {
                             "filepath": filepath, "old_string": old_str, "new_string": new_str}},
                         {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
@@ -540,20 +538,25 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
                          "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
                         native_tools)
 
-    compact_cmd = (f"python3 skills/swe-guard/scripts/run_pytest_compact.py --target {shlex.quote(targets[0])}"
-                   if targets else "python3 skills/swe-guard/scripts/run_pytest_compact.py --query test")
+    compact_cmd = (f"pytest {shlex.quote(targets[0])} -q --tb=short"
+                   if targets else "python3 -c \"print('sanity ok')\"")
     call_index += 1
     append_call(messages, call_index,
-                "Run the targeted test via run_pytest_compact.py without executing the full test suite.",
+                "Run only the targeted test file without executing the full test suite.",
                 {"name": "run_command", "arguments": {"command": compact_cmd}},
-                {"status": "ok", "stdout": "EXIT: 0\n1 passed in 0.42s", "stderr": "", "exit_code": 0},
+                {"status": "ok", "stdout": "1 passed in 0.42s", "stderr": "", "exit_code": 0},
                 native_tools)
 
+    py_files = [shlex.quote(f) for f in sorted(files_changed) if f.endswith(".py")]
+    hygiene_cmd = (
+        f"python3 -m py_compile {' '.join(py_files)} && git diff --check && git diff --stat"
+        if py_files else "git diff --check && git diff --stat"
+    )
     call_index += 1
     append_call(messages, call_index,
-                "Check syntax, protected paths, and non-empty diff with check_patch.py before submitting.",
-                {"name": "run_command", "arguments": {"command": "python3 skills/swe-guard/scripts/check_patch.py"}},
-                {"status": "ok", "stdout": f"KEPT_FILES: {sorted(files_changed)}\nSTATUS: READY_FOR_SUBMIT",
+                "Verify Python syntax, whitespace hygiene, and non-empty diff before submitting.",
+                {"name": "run_command", "arguments": {"command": hygiene_cmd}},
+                {"status": "ok", "stdout": f" {len(files_changed)} file(s) changed\n",
                  "stderr": "", "exit_code": 0},
                 native_tools)
 
@@ -1437,9 +1440,8 @@ def main() -> int:
                         help="written into the synthetic user prompt (default: %(default)s, "
                              "submission/eval_config.yaml の max_turns)")
     parser.add_argument("--max-time-minutes", type=float, default=DEFAULT_MAX_TIME_MINUTES)
-    parser.add_argument("--no-patch-examples", type=int, default=8,
-                        help="role=main のとき、原因が repo の外の設定にある failure を NO_PATCH で "
-                             "終わる教材をこの件数だけ足す（0 で無効）")
+    parser.add_argument("--no-patch-examples", type=int, default=0,
+                        help="role=main のとき NO_PATCH で終わる合成教材の件数（公式ハーネスは全タスク変更必須のため既定 0 で無効）")
     parser.add_argument("--recovery-examples", type=int, default=24,
                         help="role=main のとき、FileEditError -> extract_block.py -> edit_file 成功 "
                              "-> swe-guard 検証の回復教材をこの件数だけ足す（0 で無効）")

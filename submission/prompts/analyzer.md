@@ -8,8 +8,12 @@ parent engineer a decision-ready report.
      and callees.
    - `get_code_subgraph(nodes)` to see how 2-4 candidate symbols connect.
    - `read_file(filepath, start_line, end_line)` to confirm the exact code (the argument is
-   `filepath`, not `path`). 150 lines max per call.
-   - `run_command("grep -rn ... | head -40")` for text search. No `pip`, no network.
+     `filepath`, not `path`). 150 lines max per call.
+   - `run_command("grep -rn --exclude-dir=docs --exclude-dir='.*' '<symbol>' . | head -40")` for
+     text search. **CRITICAL**: NEVER pass a full English sentence or PR title to `grep` — search
+     ONLY concrete code identifiers (function/class/parameter names like `convert_underscores`,
+     exception names, or exact literal strings), and always exclude `docs/` so translated markdown
+     files do not hide source code matches. No `pip`, no network.
 2. Read at most 4 files, at most 2 chunks per file. Prefer precision over completeness.
 3. **Every `old_string` you recommend must come from a `read_file` you ran in this session** on
    that file and line range. Quote it verbatim (whitespace included) and cite the

@@ -11,10 +11,10 @@
 # for `edit_file` / `write_file` payloads while capping runaway reasoning early.
 temperature: 0.2
 top_p: 0.95
+frequency_penalty: 0.3          # stop repetitive tool_call / text loops within a single turn
 max_output_tokens: 8192
 thinking_config:
   thinking_budget: 1536
-  include_thoughts: false       # HARNESS_README §2.4: thinking_budget > 0 still enables reasoning
-                                # on every turn, while false strips prior turns' `<|channel>thought`
-                                # from history (prevents self-conditioning hallucinations & 32k bloat)
+  include_thoughts: false       # HARNESS_README §2.4: thinking_budget > 0 enables reasoning on
+                                # every turn while stripping prior turns' `<|channel>thought` from history
   # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm

@@ -111,9 +111,11 @@ push-submission: validate
 	@mkdir -p .kaggle/dataset-submission
 	@rm -rf .kaggle/dataset-submission/agent.yaml .kaggle/dataset-submission/prompts \
 	       .kaggle/dataset-submission/sub_agents .kaggle/dataset-submission/configs \
-	       .kaggle/dataset-submission/eval_config.yaml .kaggle/dataset-submission/adapters
+	       .kaggle/dataset-submission/eval_config.yaml .kaggle/dataset-submission/adapters \
+	       .kaggle/dataset-submission/skills
 	@cp submission/agent.yaml submission/eval_config.yaml .kaggle/dataset-submission/
 	@cp -r submission/prompts submission/configs submission/sub_agents .kaggle/dataset-submission/
+	@if [ -d submission/skills ]; then cp -r submission/skills .kaggle/dataset-submission/skills; fi
 	@if [ -d submission/adapters ] && [ -n "$$(find submission/adapters -name 'adapter_config.json')" ]; then \
 	  cp -r submission/adapters .kaggle/dataset-submission/adapters; fi
 	@$(KAGGLE) datasets version -p .kaggle/dataset-submission -m "sync submission/ $$(date -u +%Y-%m-%dT%H:%M:%SZ)" -r tar -q \
@@ -121,8 +123,8 @@ push-submission: validate
 
 SUB_ZIP_DATASET ?= gemma4-my-submission
 push-submission-zip: submission.zip
-	@mkdir -p .kaggle/dataset-submission-zip
-	@cp -f submission.zip .kaggle/dataset-submission-zip/submission.zip
+	@rm -rf .kaggle/dataset-submission-zip && mkdir -p .kaggle/dataset-submission-zip
+	@unzip -o -q submission.zip -d .kaggle/dataset-submission-zip
 	@user="$(USERNAME)"; \
 	if [ "$$user" = "<username>" ]; then \
 	  user=$$($(KAGGLE) config view | sed -n 's/^- username: //p'); \
@@ -130,8 +132,8 @@ push-submission-zip: submission.zip
 	test -n "$$user" || (echo "USERNAME を指定してください (例: make push-submission-zip USERNAME=your_id)"; exit 2); \
 	printf '{\n  "title": "%s",\n  "id": "%s/%s",\n  "licenses": [{"name": "CC0-1.0"}]\n}\n' \
 	  "$(SUB_ZIP_DATASET)" "$$user" "$(SUB_ZIP_DATASET)" > .kaggle/dataset-submission-zip/dataset-metadata.json; \
-	($(KAGGLE) datasets version -p .kaggle/dataset-submission-zip -m "sync submission.zip $$(date -u +%Y-%m-%dT%H:%M:%SZ)" -q \
-	  || $(KAGGLE) datasets create -p .kaggle/dataset-submission-zip -q) && \
+	($(KAGGLE) datasets version -p .kaggle/dataset-submission-zip -m "sync submission.zip $$(date -u +%Y-%m-%dT%H:%M:%SZ)" -r tar -q \
+	  || $(KAGGLE) datasets create -p .kaggle/dataset-submission-zip -r tar -q) && \
 	echo "[push-submission-zip] uploaded to $$user/$(SUB_ZIP_DATASET) (private)"
 
 push-eval: push-code push-submission

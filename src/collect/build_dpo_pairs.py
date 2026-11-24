@@ -493,7 +493,7 @@ def _trim_prefix_chars(prefix: list[dict[str, Any]], max_chars: int = 36000) -> 
 def _extract_chosen_targets(chosen_messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], list[str], str]:
     edits: list[dict[str, str]] = []
     files: list[str] = []
-    pytest_cmd = "python3 skills/swe-guard/scripts/run_pytest_compact.py --query test"
+    pytest_cmd = "git diff --stat"
     for msg in chosen_messages:
         for call in msg.get("tool_calls") or []:
             cname = _call_name(call)
@@ -509,15 +509,11 @@ def _extract_chosen_targets(chosen_messages: list[dict[str, Any]]) -> tuple[list
                 })
             elif cname == "run_command":
                 cmd = str(cargs.get("command") or "")
-                if "pytest" in cmd and (".py" in cmd or "run_pytest_compact.py" in cmd):
-                    if "run_pytest_compact.py" in cmd:
-                        pytest_cmd = cmd
-                    else:
-                        # Extract first .py[::node] token for compact runner
-                        for tok in cmd.split():
-                            if ".py" in tok and not tok.startswith("-"):
-                                pytest_cmd = f"python3 skills/swe-guard/scripts/run_pytest_compact.py --target {shlex.quote(tok)}"
-                                break
+                if "pytest" in cmd and ".py" in cmd:
+                    for tok in cmd.split():
+                        if ".py" in tok and not tok.startswith("-") and "skills/" not in tok:
+                            pytest_cmd = f"pytest {shlex.quote(tok)} -q --tb=short"
+                            break
     return edits, files, pytest_cmd
 
 
@@ -624,10 +620,9 @@ def build_step_pairs(
                             query_lines = [ln.strip() for ln in ref_old.splitlines() if ln.strip()]
                             query = query_lines[0][:60] if query_lines else ""
                             if query:
-                                cmd = (f"python3 skills/swe-guard/scripts/extract_block.py "
-                                       f"--filepath {shlex.quote(target_fp)} --query {shlex.quote(query)} --context 4")
+                                cmd = f"grep -n -C 4 {shlex.quote(query)} {shlex.quote(target_fp)} | head -n 30"
                                 chosen_step = _step_call_msg(
-                                    f"Extract the exact verbatim block and verify uniqueness in {target_fp} before editing.",
+                                    f"Locate the exact line numbers and verbatim text in {target_fp} before calling edit_file.",
                                     "run_command", {"command": cmd}, f"step_{idx}",
                                 )
                             else:
@@ -663,26 +658,26 @@ def build_step_pairs(
                             )
                         else:
                             chosen_step = _step_call_msg(
-                                "Verify non-empty diff with check_patch.py before calling submit_patch.",
-                                "run_command", {"command": "python3 skills/swe-guard/scripts/check_patch.py"}, f"step_{idx}",
+                                "Verify non-empty diff with git diff --stat before calling submit_patch.",
+                                "run_command", {"command": "git diff --check && git diff --stat"}, f"step_{idx}",
                             )
                         step_reason = "step_empty_submit"
 
                     # 4. Full-suite pytest (`pytest tests/`) instead of targeted test
                     elif role == "main" and cname == "run_command" and _is_full_suite_pytest(str(cargs.get("command") or "")):
                         chosen_step = _step_call_msg(
-                            "Run only the targeted test file with run_pytest_compact.py instead of the entire suite.",
+                            "Run only the targeted test file instead of the entire test suite.",
                             "run_command", {"command": gold_pytest_cmd}, f"step_{idx}",
                         )
                         step_reason = "step_full_pytest"
 
                     # 5. Premature text stop / wrong NO_PATCH without submit_patch
                     elif role == "main" and idx == last_asst_idx and not calls and not any_submit:
-                        if chosen_has_action or not _ends_with_no_patch([msg]):
+                        if chosen_has_action or _ends_with_no_patch([msg]):
                             if any_edit_ok:
                                 chosen_step = _step_call_msg(
-                                    "Run check_patch.py and submit_patch instead of stopping without submitting.",
-                                    "run_command", {"command": "python3 skills/swe-guard/scripts/check_patch.py"}, f"step_{idx}",
+                                    "Verify the diff and call submit_patch instead of stopping without submitting.",
+                                    "run_command", {"command": "git diff --check && git diff --stat"}, f"step_{idx}",
                                 )
                             elif gold_files:
                                 chosen_step = _step_call_msg(

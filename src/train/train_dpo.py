@@ -97,7 +97,9 @@ def _trim_prompt_messages(
         budget = max(512, max_len - comp_tokens - 32)
         trimmed = list(prompt_msgs)
         while len(trimmed) > 2:
-            rendered = tokenizer.apply_chat_template(trimmed, add_generation_prompt=True, tokenize=False)
+            rendered = tokenizer.apply_chat_template(
+                trimmed, add_generation_prompt=True, tokenize=False, enable_thinking=True, preserve_thinking=True
+            )
             if len(tokenizer.encode(rendered, add_special_tokens=False)) <= budget:
                 break
             # Drop one assistant turn and its immediately following tool observations after [system, user]
@@ -122,21 +124,28 @@ def _render_pair_texts(
     norm_chosen = [_normalize_tool_calls(m) for m in chosen_msgs]
     norm_rejected = [_normalize_tool_calls(m) for m in rejected_msgs]
     try:
-        prompt_text = tokenizer.apply_chat_template(norm_prompt, add_generation_prompt=True, tokenize=False)
+        tpl_kw = {"enable_thinking": True, "preserve_thinking": True}
+        prompt_text = tokenizer.apply_chat_template(
+            norm_prompt, add_generation_prompt=True, tokenize=False, **tpl_kw
+        )
         chosen_full = tokenizer.apply_chat_template(
-            norm_prompt + norm_chosen, add_generation_prompt=False, tokenize=False
+            norm_prompt + norm_chosen, add_generation_prompt=False, tokenize=False, **tpl_kw
         )
         rejected_full = tokenizer.apply_chat_template(
-            norm_prompt + norm_rejected, add_generation_prompt=False, tokenize=False
+            norm_prompt + norm_rejected, add_generation_prompt=False, tokenize=False, **tpl_kw
         )
         if chosen_full.startswith(prompt_text) and rejected_full.startswith(prompt_text):
             c_slice = chosen_full[len(prompt_text):]
             r_slice = rejected_full[len(prompt_text):]
             trimmed_prompt = _trim_prompt_messages(tokenizer, norm_prompt, c_slice, r_slice, max_len)
             if len(trimmed_prompt) != len(norm_prompt):
-                prompt_text = tokenizer.apply_chat_template(trimmed_prompt, add_generation_prompt=True, tokenize=False)
+                prompt_text = tokenizer.apply_chat_template(
+                    trimmed_prompt, add_generation_prompt=True, tokenize=False, **tpl_kw
+                )
             return prompt_text, c_slice, r_slice
-        base_text = tokenizer.apply_chat_template(norm_prompt, add_generation_prompt=False, tokenize=False)
+        base_text = tokenizer.apply_chat_template(
+            norm_prompt, add_generation_prompt=False, tokenize=False, **tpl_kw
+        )
         if chosen_full.startswith(base_text) and rejected_full.startswith(base_text):
             return base_text, chosen_full[len(base_text):], rejected_full[len(base_text):]
     except Exception:

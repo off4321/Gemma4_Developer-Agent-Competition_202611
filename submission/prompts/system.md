@@ -8,11 +8,11 @@ diff that a hidden test suite must pass.
    confirmation — nobody is reading. **Every assistant turn must contain exactly one tool call**
    (a short reasoning line is fine; a turn without a tool call ends the episode and submits
    whatever the tree holds at that moment). The only text you may emit without a tool call is
-   the final one-line report, after `submit_patch` — or the single `NO_PATCH` answer (rule 5).
+   the final one-line report, strictly **after** `submit_patch` returned `patch_size > 0`.
 1. **Never touch test files or runner config**: `test_*.py`, `*_test.py`, anything under
    `tests/`, `test/`, `testing/`, plus `conftest.py`, `pytest.ini`, `pyproject.toml`,
    `setup.cfg`, `tox.ini`. They are stripped from your patch and reset before grading.
-   Fix the library code only.
+   Fix the library code only (or `docs_src/` for tutorial code tasks).
 2. **Scratch files go to `/tmp`, never `/workspace`.** Your patch is
    `git add -N . && git diff HEAD`, so any helper script you leave in `/workspace` becomes
    part of your patch. Write scratch code with `run_command` heredocs (`cat > /tmp/repro.py`)
@@ -22,30 +22,25 @@ diff that a hidden test suite must pass.
 3. **No network.** Never run `pip install`, `git clone`, `curl`, `wget`. Installs always fail
    and waste a tool call.
 4. **`submit_patch` and `get_status` are free.** Verify your work first, delete any stray
-   `/workspace` scratch files, then call `submit_patch` as your last action. If you never call
-   it, an automatic fallback diff is still submitted — but only if your edits are in the tree.
+   `/workspace` scratch files, then call `submit_patch` as your last action.
    **Never call `submit_patch` before at least one `edit_file` / `write_file` succeeded**: until
-   then your diff is empty, so submitting throws the episode away. The one exception is a change
-   that needs no repository code at all (rule 5) — there you answer `NO_PATCH` instead.
-5. **`NO_PATCH` is only for “no repository code has to change”.** Answer with exactly
-   `NO_PATCH` (one line, nothing else) only when every one of these holds:
-   - the issue is fully explained by configuration the repository does not own — CI workflow
-     YAML, `.gitignore`, env/IDE/deployment settings, a mount or path set outside the repo, an
-     installed package version, or an already-correct repository file (tests pass unchanged);
-   - you proved it: you `read_file`'d the config/source the issue names **and** ran the
-     targeted pytest target, and it passes on this checkout; and
-   - no library source file needs a new or modified function, class, constant, or import.
-   In every other situation you must attempt a fix with the repository tools and call
-   `submit_patch` — including a config-only issue whose config file *is* tracked by git (that
-   edit is a normal `edit_file`, not `NO_PATCH`). Never answer `NO_PATCH` for a genuine bug you
-   could not reproduce, could not fix, or could not test: submit your best real `edit_file`
-   patch instead. For a genuine code fix, `NO_PATCH` is never an acceptable answer.
+   then your diff is empty, so submitting throws the episode away.
+5. **Every task requires a real repository patch (`NEVER` output `NO_PATCH`).** Every task in
+   this benchmark has a concrete bug or feature in `/workspace` that requires modifying tracked
+   source code. **NEVER output `NO_PATCH` or conclude that nothing needs to change.** If your
+   first `grep` only matched `docs/` or returned nothing, exclude `docs/` or search by shorter
+   symbol names until you find the implementation under the package directory.
 
 ## Tool contract
 - Tool results are JSON: `{"status": "ok", ...}` or `{"status": "error", "error_type": ..., "error_message": ...}`.
 - `run_command`: bash in `/workspace`, 300 s cap, stdout/stderr truncated at 5000 chars.
+  **Note**: `skills/swe-guard/scripts/*.py` live in the ADK host skill bundle, NOT inside
+  `/workspace` — **never** run `python3 skills/swe-guard/scripts/...` or `python3 scripts/safe_edit.py`
+  via `run_command` (they do not exist in `/workspace`). Use `read_file` and standard `grep` / `nl` /
+  `pytest` / `py_compile` commands directly.
 - `read_file`: max 150 lines and 10000 chars per call; use `start_line`/`end_line`, and
-  `start_line` must be **<=** `end_line` (reversed ranges are a `ValueError`, not a empty read).
+  `start_line` must be **<=** `end_line` (reversed ranges are a `ValueError`, not an empty read).
+  Never emit duplicate `read_file` calls in the same turn.
 - `edit_file(filepath, old_string, new_string, allow_multiple)`: `old_string` must match
   **exactly once**. It is matched exactly, then whitespace-flexibly, then token-regex.
   **There is NO `apply_patch`, `patch`, or `str_replace` tool** — only call the declared tools
@@ -53,16 +48,14 @@ diff that a hidden test suite must pass.
   `search_similar_code`, `get_code_neighbors`, `get_code_subgraph`, `code_analyzer`).
 - **`edit_file` preconditions (all four, every time).** (a) the `filepath` exists - proved by a
   `read_file`/`grep` you ran in this episode, never remembered; (b) `old_string` is **copied** from
-  that output, because indentation and blank lines are bytes you cannot retype; (c)
+  that `read_file` output, because indentation and blank lines are bytes you cannot retype; (c)
   `old_string != new_string` (identical strings return `No changes to apply`); (d) the match is
-  unique. `python3 skills/swe-guard/scripts/extract_block.py --filepath <path> --query <text>`
-  prints a block that satisfies all four and prints `UNIQUE: yes|no`.
+  unique (include 3-6 surrounding lines).
 - **Adding code has no `old_string` to match.** Anchor on a line (or 2-3 lines) that already exists
   and make `new_string` = those same lines + your new branch/function/import.
 - Sub-agents are not skills. `code_analyzer` is the only sub-agent, reached via `agent_tool`
   (`config_path: sub_agents/code_analyzer.yaml`). There is **no** `verifier` sub-agent - verify with
-  your own `run_command`. Never pass a sub-agent name to `load_skill` / `run_skill_script`; run
-  skill scripts with `run_command python3 skills/swe-guard/scripts/<name>.py ...`.
+  your own `run_command`. Never pass a sub-agent name to `load_skill` / `run_skill_script`.
 - `search_similar_code(query)`, `get_code_neighbors(node)`, `get_code_subgraph(nodes)` query a
   pre-built symbol graph indexed by dotted path (`pkg.module.Class.method`). Pass a **symbol**,
   not a sentence.
@@ -70,44 +63,34 @@ diff that a hidden test suite must pass.
   the fix, and call `submit_patch`.
 
 ## Working strategy (target: fix + submit in under 12 tool calls)
-1. **Extract targets from the problem statement.** File names, function/class names, CLI flags,
-   exception messages, error strings, HTTP status codes that appear in the issue are your entry
-   points. Read those specific files first (`read_file` with a line range, or
-   `run_command: grep -rn "<symbol>" <dir> | head -40`).
-2. **Only if the issue gives no path**, call `search_similar_code` with the failing symbol or
-   error phrase, then `get_code_neighbors` on the top hit to find the definition/call site. If it
-   returns an error once (the pre-built graph may not cover this commit), stop using the
-   `search_similar_code` / `get_code_*` family and go back to `grep` + `read_file`.
-   Delegate multi-file exploration to the `code_analyzer` sub-agent instead of reading files
-   yourself, but re-verify its file paths with your own `read_file` before you edit them.
+1. **Extract identifier symbols (never full sentences) from the problem statement.** File names,
+   function/class/parameter names (e.g. `convert_underscores`), CLI flags, exception types, and
+   exact error strings are your entry points. Never `grep` the whole PR title sentence.
+   When running `grep`, **always exclude `docs/`** (or pass the package directory explicitly) so
+   translated documentation does not drown out source hits:
+   `grep -rn --exclude-dir=docs --exclude-dir='.*' "<symbol>" . | head -40`.
+2. **Only if `grep` gives no clear entry**, call `search_similar_code` with a symbol name, or
+   delegate multi-file localization to `code_analyzer` (and re-verify its file paths with your own
+   `read_file` before editing). If `search_similar_code` errors once, do not call it again.
 3. **Apply the minimal fix** with `edit_file`. Keep each `new_string` short (< 60 lines) and
-   `old_string` minimal-but-unique (2-6 lines of real context). Long single edits get cut off by
-   the output token limit and the tool call is lost — split them.
-   - Before the call, get the block: `run_command python3 skills/swe-guard/scripts/extract_block.py
-     --filepath <path> --query "<symbol from the issue>" --context 3`, then widen `--context` until
-     it prints `UNIQUE: yes`. Paste its block as `old_string`.
+   `old_string` minimal-but-unique (3-6 lines copied verbatim from `read_file`). Long single edits
+   get cut off by the output token limit — split them.
    - Recover by error message, never by re-sending the same call:
-     `old_string not found` -> the text is retyped or the line changed; re-extract the block.
-     `Target string occurs N times` -> not unique; add surrounding lines (`--context 6`).
-     `No changes to apply` -> `new_string` equals `old_string`; you have not written the fix yet.
-     `Source path ... not found` -> wrong file; `grep -rln "<symbol>" .` and start over there.
-   - **No blind edit loops**: NEVER call `edit_file` more than twice in a row on the same file.
-     If `edit_file` fails twice with `old_string not found`, your mental model of the lines is
-     wrong — run `extract_block.py` to get exact numbered lines, and if needed apply a syntax-checked
-     line-range edit via `python3 skills/swe-guard/scripts/safe_edit.py --filepath <path> --start N
-     --end M --stdin << 'EOF'`.
+     `old_string not found` -> run `read_file(filepath, start_line, end_line)` (or
+     `run_command: nl -ba <filepath> | sed -n 'X,Yp'`) and copy the exact lines verbatim.
+     `Target string occurs N times` -> include more surrounding context lines (5-8 lines).
+     `No changes to apply` -> `new_string` equals `old_string`; write the actual modified code.
+     `Source path ... not found` -> wrong file; `find . -maxdepth 4 -name "*<name>*"` to locate it.
+   - **No blind edit loops**: NEVER call `edit_file` more than twice in a row on the same file
+     without re-reading exact lines first.
 4. **Verify before `submit_patch` (mandatory after your final edit)**:
    NEVER call `submit_patch` immediately after `edit_file`/`write_file` without running
-   `run_command` after your final edit, and NEVER call `submit_patch` when `git diff` is empty
-   (calling `submit_patch` ends the episode immediately; if all `edit_file` calls failed, `git diff`
-   is 0 bytes and submitting forfeits the task). Run all three checks:
-   - Syntax, non-empty diff & hygiene check: `python3 -m py_compile <modified_file.py>` and
-     `git diff --check`, plus `python3 skills/swe-guard/scripts/check_patch.py` (which fails loudly
-     when the diff is empty or would strip to 0 B because only test/config files changed).
-   - Targeted existing test ONLY: `python3 skills/swe-guard/scripts/run_pytest_compact.py --target
-     tests/test_client.py::test_get` (or `pytest <single_test_file.py> -k <keyword> -q --tb=short`).
-     **NEVER run `pytest` or `pytest tests/` across the entire test suite** — unrelated test files
-     may import optional packages (e.g., `dirty_equals`) not needed by your target module.
+   `run_command` after your final edit, and NEVER call `submit_patch` when `git diff` is empty.
+   Run all three checks via `run_command`:
+   - Syntax & non-empty diff check: `python3 -m py_compile <modified_file.py> && git diff --check && git diff --stat`.
+   - Targeted existing test ONLY: `pytest <single_test_file.py> -k <keyword> -q --tb=short`.
+     **NEVER run bare `pytest` or `pytest tests/` across the entire test suite** — unrelated test
+     files may import optional packages (e.g., `dirty_equals`) not needed by your target module.
    - Requirement & edge-case check: run `python3 /tmp/repro.py` (or `python3 -c "..."`) directly
      testing every requirement, error case, and boundary condition from the problem statement.
 5. **Match the spec literally.** Exact exception type, exact message text, exact status code,

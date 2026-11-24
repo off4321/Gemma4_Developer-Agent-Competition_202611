@@ -155,7 +155,7 @@ def test_read_observation_keeps_the_string_the_edit_needs() -> None:
     assert tail in kept["content"]
 
 
-def test_recovery_trajectory_teaches_extract_block_and_swe_guard() -> None:
+def test_recovery_trajectory_teaches_reread_and_native_hygiene() -> None:
     record = collect.build_recovery_trajectory(
         two_hunk_task(), SYSTEM_PROMPT, BUDGET, True, 6, collect.DEFAULT_MAX_HUNK_LINES
     )
@@ -166,9 +166,10 @@ def test_recovery_trajectory_teaches_extract_block_and_swe_guard() -> None:
         for m in record["messages"] for c in (m.get("tool_calls") or [])
     ]
     names = [n for n, _ in calls]
-    # First edit fails, then run_command calls extract_block.py, then exact edit_file succeeds
+    # First edit fails, then read_file re-reads exact range, then exact edit_file succeeds
     assert names.count("edit_file") == 3
+    assert names.count("read_file") >= 2
     run_cmds = [a["command"] for n, a in calls if n == "run_command"]
-    assert any("extract_block.py" in cmd for cmd in run_cmds)
-    assert any("run_pytest_compact.py" in cmd for cmd in run_cmds)
-    assert any("check_patch.py" in cmd for cmd in run_cmds)
+    assert all("skills/swe-guard" not in cmd for cmd in run_cmds)
+    assert any("pytest" in cmd for cmd in run_cmds)
+    assert any("py_compile" in cmd and "git diff --stat" in cmd for cmd in run_cmds)

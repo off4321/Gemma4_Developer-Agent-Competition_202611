@@ -143,7 +143,13 @@ def load_examples(path: str, max_examples: int) -> list[Conversation]:
 
 
 def _normalize_tool_calls(message: Message) -> Message:
-    """Deserialize string `function.arguments` into dicts for Gemma 4's Jinja chat_template."""
+    """Deserialize string `function.arguments` into dicts and move `content` thought to `reasoning_content`.
+
+    In Gemma 4's Jinja chat_template, `message['content']` on an assistant tool-call turn is emitted
+    AFTER `<|tool_call>...<tool_call|>` (and even after `<|tool_response>`), which breaks prefix
+    stability and trains reversed output ordering. Placing the thought in `reasoning_content` renders
+    `<|channel>thought\\n...\\n<channel|><|tool_call>call:...<tool_call|>` in the native Gemma 4 order.
+    """
     calls = message.get("tool_calls")
     if not calls:
         return message
@@ -159,7 +165,16 @@ def _normalize_tool_calls(message: Message) -> Message:
             fn = {**fn, "arguments": parsed if isinstance(parsed, dict) else {"raw": parsed}}
             call = {**call, "function": fn}
         normalized.append(call)
-    return {**message, "tool_calls": normalized}
+    updated: Message = {**message, "tool_calls": normalized}
+    if (
+        updated.get("role") in ASSISTANT_ROLES
+        and not (updated.get("reasoning_content") or updated.get("reasoning"))
+        and isinstance(updated.get("content"), str)
+        and updated["content"].strip()
+    ):
+        updated["reasoning_content"] = updated["content"].strip()
+        updated["content"] = ""
+    return updated
 
 
 def render_message(tokenizer: AutoTokenizer, message: Message) -> str:
@@ -189,9 +204,19 @@ def _render_conversation(tokenizer: AutoTokenizer, messages: Conversation) -> st
 
     Gemma 4 serialises `tool_calls` only when the template sees the turns around the call. Handing
     it `[message]` takes a template branch without the call header, and the adapter then answers
-    `<|tool_call>` with literal `<|turn>model{...}` garbage.
+    `<|tool_call>` with literal `<|turn>model{...}` garbage. Passing `enable_thinking=True` and
+    `preserve_thinking=True` ensures `<|think|>` and `<|channel>thought...<channel|>` match vLLM.
     """
-    return tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=False,
+            tokenize=False,
+            enable_thinking=True,
+            preserve_thinking=True,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
 
 
 def is_supervised(role: str | None, args: argparse.Namespace) -> bool:
