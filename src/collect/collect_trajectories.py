@@ -357,7 +357,7 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
     first_lines = [ln.strip() for ln in str(first_edit.get("old_string") or "").splitlines() if ln.strip()]
     sym_candidates = hunk_symbols([f" {ln}" for ln in first_lines])
     needle = (sym_candidates[0] if sym_candidates else Path(first_fp).stem)
-    grep_cmd = f"grep -rn --exclude-dir=docs --exclude-dir='.*' {shlex.quote(needle)} {_grep_target(first_fp)} | head -n 30"
+    grep_cmd = f"grep -rn --exclude-dir=docs --exclude-dir=.git --exclude-dir=.venv {shlex.quote(needle)} {_grep_target(first_fp)} | head -n 30"
     grep_hit = f"{first_fp}:{first_start}:{first_lines[0][:80] if first_lines else needle}"
     call_index += 1
     append_call(
@@ -905,7 +905,7 @@ def build_analyzer_trajectory(task: dict[str, Any], system_prompt: str, budget: 
     append_call(messages, call_index,
                 grep_thought,
                 {"name": "run_command", "arguments": {
-                    "command": f'grep -rn --exclude-dir=docs --exclude-dir=".*" "{needle}" {_grep_target(first["path"])} | head -40'}},
+                    "command": f'grep -rn --exclude-dir=docs --exclude-dir=.git --exclude-dir=.venv "{needle}" {_grep_target(first["path"])} | head -40'}},
                 {"status": "ok", "exit_code": 0,
                  "stdout": "\n".join(f"{h['path']}:{h['range'].split('-')[0]}: {needle}" for h in hunks[:5]),
                  "stderr": ""},

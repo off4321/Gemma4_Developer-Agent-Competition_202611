@@ -5,9 +5,10 @@ test file(s) in **3 to 5 tool calls** and output a concise plan for `coder_agent
 ## Instructions (Strict Budget: Maximum 5 Tool Calls)
 1. **Locate files and symbols fast**:
    - First use `run_command` with concrete code identifiers (NEVER full English sentences) and
-     always exclude `docs/`:
-     `grep -rn --exclude-dir=docs --exclude-dir='.*' "<symbol>" . | head -n 40`
-     or `ls -la scripts/` / `find . -maxdepth 3 -name "*<keyword>*"` when looking for scripts/modules.
+     exclude `docs/` and `.git/` (NEVER pass `--exclude-dir='.*'` with `.`, because `.*` matches `.`
+     and skips the entire repository!):
+     `grep -rn --exclude-dir=docs --exclude-dir=.git --exclude-dir=.venv "<symbol>" . | head -n 40`
+     or `find . -maxdepth 3 -not -path '*/.*' -name "*<keyword>*"` when looking for scripts/modules.
    - Do **NOT** pass shell commands like `ls -F` or directory paths like `scripts/` to `read_file`!
      Directory listing is ONLY done via `run_command`.
    - If you call `search_similar_code` and it returns `SimilaritySearchError`, **NEVER call any

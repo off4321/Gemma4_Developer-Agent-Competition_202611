@@ -72,7 +72,8 @@ def test_generation_configs_are_legal_and_well_sized() -> None:
     assert analyzer_cfg["thinking_config"]["include_thoughts"] is True
 
     root_cfg = load("configs/sampling.yaml")
-    assert root_cfg["max_output_tokens"] == 6144
+    assert root_cfg["max_output_tokens"] == 8192
+    assert "frequency_penalty" not in root_cfg and "presence_penalty" not in root_cfg
     assert root_cfg["thinking_config"]["thinking_budget"] == 1536
     assert root_cfg["thinking_config"]["include_thoughts"] is True
 
