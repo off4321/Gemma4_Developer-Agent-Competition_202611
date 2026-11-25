@@ -5,18 +5,18 @@
 # (HARNESS_README §2.3 / §2.5).
 name: verifier
 description: >-
-  Verifies the parent's pending patch by running the targeted tests (never a bare `pytest`)
-  and returns a fixed machine-readable report: VERDICT / PENDING_TESTS / FAILURE_SUMMARY /
-  FILES_CHANGED / CONFIDENCE / NEXT_ACTION. It never edits files and never calls submit_patch.
+  Independent pre-submit patch auditor. Pass the verbatim Problem Statement,
+  modified file path(s), and target test file(s). Audits non-empty git diff,
+  clean package import, targeted pytest exit 0, and exact error/warning/caller
+  conventions, returning VERDICT: GO or VERDICT: BLOCK (<exact reason>).
+  Never edits files and never calls submit_patch.
 tools:
   - run_command
   - read_file
   - get_status
 model: gemma-4-e4b-it-qat-w4a16-ct
-# 2026-11-24: verifier 自体を無効化したので adapter も外す（agent.yaml の agent_tool entry が
-# コメント中のため、この file は今どこからも参照されていない）。再度有効にする時は
-# adapters/verifier_lora/ が提出先にあることを確認してからこの行を戻す。
-# adapter: verifier_lora   # re-enable together with the agent_tool entry in ../agent.yaml
+# Runs on base `gemma-4-e4b-it-qat-w4a16-ct` (shared with root; zero extra LoRA VRAM).
+# adapter: verifier_lora
 instruction: !include ../prompts/verifier.md
 # ADK `generate_config` (max_tokens / max_thoughts) is NOT accepted here: this harness wants
 # `generate_content_config` with `max_output_tokens: 1024` and

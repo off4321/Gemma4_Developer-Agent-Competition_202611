@@ -8,7 +8,7 @@
 # and small: a STOP-lost / rambling verdict wastes the parent's turns.
 temperature: 0.1
 top_p: 0.9
-max_output_tokens: 1024         # the verdict is ~150 tokens; 1024 leaves room for one re-read
+max_output_tokens: 1536         # concise audit verdict + failure lines if BLOCK
 thinking_config:
-  thinking_budget: 2048         # same thinking step as the root agent (configs/sampling.yaml)
-  include_thoughts: false       # thoughts never enter the parent's context (HARNESS §14.2)
+  thinking_budget: 1024         # crisp reasoning before running audit commands
+  include_thoughts: true        # preserves e4b tool-call integrity; AgentTool hides thoughts from parent

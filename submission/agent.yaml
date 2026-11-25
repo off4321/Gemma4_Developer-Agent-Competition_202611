@@ -28,10 +28,10 @@ tools:
   - agent_tool:
       config_path: sub_agents/code_analyzer.yaml
       skip_summarization: true
-  # keep verifier commented out
-  # - agent_tool:
-  #     config_path: sub_agents/verifier.yaml
-  #     skip_summarization: true
+  # isolated pre-submit patch auditor (runs on base e4b, no extra LoRA needed)
+  - agent_tool:
+      config_path: sub_agents/verifier.yaml
+      skip_summarization: true
 skills:
   - skills/swe-guard
 generate_content_config: !include configs/sampling.yaml
