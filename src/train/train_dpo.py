@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from train.train_lora import (  # noqa: E402
     _normalize_tool_calls,
+    _strip_thought_fields,
     build_lora_config,
     build_optimizer,
     load_base,
@@ -55,19 +56,21 @@ def parse_args() -> argparse.Namespace:
 
     # DPO & optimisation
     p.add_argument("--beta", type=float, default=0.1, help="DPO KL penalty coefficient")
-    p.add_argument("--loss_types", default="sigmoid_norm,sft",
-                   help="comma-separated trl DPO loss types (default: sigmoid_norm,sft for MPO/RPO anchoring)")
-    p.add_argument("--loss_weights", default="1.0,0.5",
-                   help="comma-separated weights matching --loss_types (default: 1.0,0.5)")
-    p.add_argument("--max_len", type=int, default=8192)
+    p.add_argument("--loss_types", default="sigmoid_norm",
+                   help="comma-separated trl DPO loss types (default: sigmoid_norm length-normalised DPO)")
+    p.add_argument("--loss_weights", default="1.0",
+                   help="comma-separated weights matching --loss_types (default: 1.0)")
+    p.add_argument("--max_len", type=int, default=10240)
     p.add_argument("--max_prompt_len", type=int, default=None,
-                   help="prompt token cap (default: max_len // 2)")
+                   help="prompt token cap (default: max_len - 2048)")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-6)
+    p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.1)
+    p.add_argument("--keep_prior_thoughts", action="store_true", default=False,
+                   help="keep prior assistant reasoning_content in prompt history (default False matches include_thoughts=false)")
     p.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     p.add_argument("--use_4bit", action="store_true", help="QLoRA 4-bit base")
     p.add_argument("--seed", type=int, default=13)
@@ -75,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry_run", action="store_true", help="render 1 pair, save adapter, exit")
     args = p.parse_args()
     if args.max_prompt_len is None:
-        args.max_prompt_len = max(512, args.max_len // 2)
+        args.max_prompt_len = max(1024, args.max_len - 2048)
     return args
 
 
@@ -85,6 +88,7 @@ def _trim_prompt_messages(
     chosen_text: str,
     rejected_text: str,
     max_len: int,
+    preserve_thinking: bool = False,
 ) -> list[dict[str, Any]]:
     """Drop oldest middle turns from `prompt_msgs[2:]` so `trl`'s `keep_start` never cuts completions."""
     if max_len <= 0 or len(prompt_msgs) <= 2 or not hasattr(tokenizer, "encode"):
@@ -98,7 +102,8 @@ def _trim_prompt_messages(
         trimmed = list(prompt_msgs)
         while len(trimmed) > 2:
             rendered = tokenizer.apply_chat_template(
-                trimmed, add_generation_prompt=True, tokenize=False, enable_thinking=True, preserve_thinking=True
+                trimmed, add_generation_prompt=True, tokenize=False,
+                enable_thinking=True, preserve_thinking=preserve_thinking,
             )
             if len(tokenizer.encode(rendered, add_special_tokens=False)) <= budget:
                 break
@@ -118,13 +123,17 @@ def _render_pair_texts(
     chosen_msgs: list[dict[str, Any]],
     rejected_msgs: list[dict[str, Any]],
     max_len: int = 0,
+    keep_prior_thoughts: bool = False,
 ) -> tuple[str, str, str]:
     """Render (prompt, chosen, rejected) using full-conversation `apply_chat_template`."""
-    norm_prompt = [_normalize_tool_calls(m) for m in prompt_msgs]
+    norm_prompt = [
+        _normalize_tool_calls(m) if keep_prior_thoughts else _strip_thought_fields(_normalize_tool_calls(m))
+        for m in prompt_msgs
+    ]
     norm_chosen = [_normalize_tool_calls(m) for m in chosen_msgs]
     norm_rejected = [_normalize_tool_calls(m) for m in rejected_msgs]
     try:
-        tpl_kw = {"enable_thinking": True, "preserve_thinking": True}
+        tpl_kw = {"enable_thinking": True, "preserve_thinking": keep_prior_thoughts}
         prompt_text = tokenizer.apply_chat_template(
             norm_prompt, add_generation_prompt=True, tokenize=False, **tpl_kw
         )
@@ -137,7 +146,9 @@ def _render_pair_texts(
         if chosen_full.startswith(prompt_text) and rejected_full.startswith(prompt_text):
             c_slice = chosen_full[len(prompt_text):]
             r_slice = rejected_full[len(prompt_text):]
-            trimmed_prompt = _trim_prompt_messages(tokenizer, norm_prompt, c_slice, r_slice, max_len)
+            trimmed_prompt = _trim_prompt_messages(
+                tokenizer, norm_prompt, c_slice, r_slice, max_len, preserve_thinking=keep_prior_thoughts
+            )
             if len(trimmed_prompt) != len(norm_prompt):
                 prompt_text = tokenizer.apply_chat_template(
                     trimmed_prompt, add_generation_prompt=True, tokenize=False, **tpl_kw
@@ -157,7 +168,13 @@ def _render_pair_texts(
     )
 
 
-def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int, max_len: int = 0) -> Dataset:
+def load_dpo_dataset(
+    path: str,
+    tokenizer: AutoTokenizer,
+    max_examples: int,
+    max_len: int = 0,
+    keep_prior_thoughts: bool = False,
+) -> Dataset:
     data_path = Path(path)
     if not data_path.is_file():
         raise SystemExit(f"[error] DPO data not found: {path} (run src/collect/build_dpo_pairs.py first)")
@@ -173,6 +190,7 @@ def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int, max
             item.get("chosen") or [],
             item.get("rejected") or [],
             max_len=max_len,
+            keep_prior_thoughts=keep_prior_thoughts,
         )
         if prompt and chosen and rejected:
             rows.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
@@ -181,7 +199,7 @@ def load_dpo_dataset(path: str, tokenizer: AutoTokenizer, max_examples: int, max
 
     if not rows:
         raise SystemExit(f"[error] no usable preference pairs in {path}")
-    print(f"[dpo] loaded {len(rows)} preference pairs from {path}")
+    print(f"[dpo] loaded {len(rows)} preference pairs from {path} (keep_prior_thoughts={keep_prior_thoughts})")
     print(f"[dpo] sample chosen[:220]: {rows[0]['chosen'][:220]!r}")
     return Dataset.from_list(rows)
 
@@ -196,7 +214,9 @@ def main() -> int:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = load_dpo_dataset(args.data, tokenizer, args.max_examples, max_len=args.max_len)
+    dataset = load_dpo_dataset(
+        args.data, tokenizer, args.max_examples, max_len=args.max_len, keep_prior_thoughts=args.keep_prior_thoughts
+    )
     model = load_base(args, model_path)
     if args.resume_from is None:
         model = get_peft_model(model, build_lora_config(args, model))

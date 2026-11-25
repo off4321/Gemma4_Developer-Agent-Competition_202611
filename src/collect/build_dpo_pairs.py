@@ -576,6 +576,7 @@ def build_step_pairs(
             assistant_indices = [i for i, m in enumerate(msgs) if i >= 1 and m.get("role") == "assistant"]
             last_asst_idx = assistant_indices[-1] if assistant_indices else -1
             any_edit_ok = False
+            any_verify_after_edit = False
             any_submit = False
             read_by_file: dict[str, list[str]] = defaultdict(list)
 
@@ -595,19 +596,21 @@ def build_step_pairs(
                     chosen_step: dict[str, Any] | None = None
                     step_reason = ""
 
-                    # 1. Failed edit_file -> teach exact copy from read_file or extract_block.py
+                    # 1. Failed edit_file -> prefer valid gold edit_file when file was read (same-tool contrast!)
                     if role == "main" and cname == "edit_file" and obs_failed:
                         fp = str(cargs.get("filepath") or "").strip()
                         bad_old = str(cargs.get("old_string") or "")
+                        bad_new = str(cargs.get("new_string") or "")
                         matched_gold = next(
                             (ge for ge in gold_edits
-                             if ge["filepath"] == fp and ge["old_string"] != bad_old
-                             and any(ge["old_string"] in body for body in read_by_file.get(fp, []))),
+                             if ge["filepath"] == fp and ge["old_string"] != ge["new_string"]
+                             and (ge["old_string"] != bad_old or bad_old == bad_new)
+                             and (bool(read_by_file.get(fp)) or bad_old == bad_new)),
                             None,
                         )
                         if matched_gold is not None:
                             chosen_step = _step_call_msg(
-                                f"Copy the exact verbatim block shown by read_file in {fp} and apply the minimal fix.",
+                                f"Copy the exact verbatim block from {fp} with a real modification (old_string != new_string).",
                                 "edit_file",
                                 {"filepath": fp, "old_string": matched_gold["old_string"],
                                  "new_string": matched_gold["new_string"]},
@@ -616,20 +619,10 @@ def build_step_pairs(
                         else:
                             not_found_path = "source path" in next_obs.lower() or "no such file" in next_obs.lower()
                             target_fp = (gold_files[0] if (not_found_path or not fp) and gold_files else fp) or "README.md"
-                            ref_old = next((ge["old_string"] for ge in gold_edits if ge["filepath"] == target_fp), bad_old)
-                            query_lines = [ln.strip() for ln in ref_old.splitlines() if ln.strip()]
-                            query = query_lines[0][:60] if query_lines else ""
-                            if query:
-                                cmd = f"grep -n -C 4 {shlex.quote(query)} {shlex.quote(target_fp)} | head -n 30"
-                                chosen_step = _step_call_msg(
-                                    f"Locate the exact line numbers and verbatim text in {target_fp} before calling edit_file.",
-                                    "run_command", {"command": cmd}, f"step_{idx}",
-                                )
-                            else:
-                                chosen_step = _step_call_msg(
-                                    f"Read {target_fp} first so old_string matches exact file bytes.",
-                                    "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
-                                )
+                            chosen_step = _step_call_msg(
+                                f"Read {target_fp} first so old_string matches exact file bytes before calling edit_file.",
+                                "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
+                            )
                         step_reason = "step_edit_error"
 
                     # 2. Invalid/disabled tool (e.g. apply_patch, verifier, failed skill lookup) or truncated <|tool_call>
@@ -648,13 +641,21 @@ def build_step_pairs(
                             chosen_step = chosen_resp[0]
                         step_reason = "step_invalid_tool"
 
-                    # 3. Empty-diff submit_patch when no edit succeeded yet
+                    # 3. Empty-diff submit_patch when no edit succeeded yet -> pair with gold edit_file if already read
                     elif role == "main" and cname == "submit_patch" and chosen_has_action and not any_edit_ok:
-                        target_fp = gold_files[0] if gold_files else ""
-                        if target_fp:
+                        read_gold = next((ge for ge in gold_edits if read_by_file.get(ge["filepath"])), None)
+                        if read_gold is not None:
                             chosen_step = _step_call_msg(
-                                f"No edit_file succeeded yet so git diff is empty; read {target_fp} and apply the fix before submitting.",
-                                "read_file", {"filepath": target_fp, "start_line": 1, "end_line": 120}, f"step_{idx}",
+                                f"Apply the minimal fix to {read_gold['filepath']} before calling submit_patch.",
+                                "edit_file",
+                                {"filepath": read_gold["filepath"], "old_string": read_gold["old_string"],
+                                 "new_string": read_gold["new_string"]},
+                                f"step_{idx}",
+                            )
+                        elif gold_files:
+                            chosen_step = _step_call_msg(
+                                f"No edit_file succeeded yet so git diff is empty; read {gold_files[0]} and apply the fix first.",
+                                "read_file", {"filepath": gold_files[0], "start_line": 1, "end_line": 120}, f"step_{idx}",
                             )
                         else:
                             chosen_step = _step_call_msg(
@@ -671,13 +672,27 @@ def build_step_pairs(
                         )
                         step_reason = "step_full_pytest"
 
+                    # 4b. Post-verification loop without submit_patch (e.g. re-reading/re-editing/re-compiling 20x)
+                    elif (
+                        role == "main"
+                        and any_edit_ok
+                        and any_verify_after_edit
+                        and not any_submit
+                        and (idx == last_asst_idx or cname in ("read_file", "edit_file"))
+                    ):
+                        chosen_step = _step_call_msg(
+                            "The fix is applied and verified; call submit_patch immediately instead of looping.",
+                            "submit_patch", {}, f"step_{idx}",
+                        )
+                        step_reason = "step_missing_submit"
+
                     # 5. Premature text stop / wrong NO_PATCH without submit_patch
                     elif role == "main" and idx == last_asst_idx and not calls and not any_submit:
                         if chosen_has_action or _ends_with_no_patch([msg]):
                             if any_edit_ok:
                                 chosen_step = _step_call_msg(
-                                    "Verify the diff and call submit_patch instead of stopping without submitting.",
-                                    "run_command", {"command": "git diff --check && git diff --stat"}, f"step_{idx}",
+                                    "Call submit_patch to record the non-empty patch before finishing.",
+                                    "submit_patch", {}, f"step_{idx}",
                                 )
                             elif gold_files:
                                 chosen_step = _step_call_msg(
@@ -717,6 +732,9 @@ def build_step_pairs(
                         pass
                 elif cname in EDIT_CALLS and next_obs and not obs_failed:
                     any_edit_ok = True
+                    any_verify_after_edit = False
+                elif cname == "run_command" and any_edit_ok and next_obs and not obs_failed:
+                    any_verify_after_edit = True
                 elif cname == "submit_patch":
                     any_submit = True
 

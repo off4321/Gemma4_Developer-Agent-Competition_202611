@@ -300,16 +300,16 @@ def build_notebook() -> nbf.NotebookNode:
             - **GPU は H100 / A100 (80GB) 前提**なので `USE_4BIT = False`（bf16）が既定です。
               e4b の bf16 学習 + AdamW で約 56 GB 必要ですが 80 GB に収まります。L4 / T4 (11 / 15GB) を選んだときだけ
               `USE_4BIT = True` にし、`MAX_LEN` も 6144 以下に下げて OOM に備えてください
-            - `MAX_LEN = 8192`（1会話の token 上限）/ `MAX_EXAMPLES = 200`（教材の会話数上限）は cell 5 にそのまま渡ります。
-              main 教材は system 指示 + read_file 観測で伸びますが、80GB あれば 8192 は安全側です
-            - `LEARNING_RATE = 5e-5`: 4bit 基底 + LoRA+ に `1e-4` を当てると tool call / turn の特殊 token が飛ぶので上げない
-              （`train_lora.py` の既定も `5e-5`）
+            - `MAX_LEN = 10240`（1ステップの token 上限）/ `MAX_EXAMPLES = 200`（教材の会話数上限）は cell 5 にそのまま渡ります。
+              `train_lora.py` は **Decision-Step SFT（1 assistant turn 単位 + 中間ターン自動トリミング + 過去思考除去）** で学習するため、
+              長い軌跡でも末尾の `edit_file` や `submit_patch` が切り捨てられず、本番の `include_thoughts: false` と完全一致します
+            - `LEARNING_RATE = 5e-5` / Cosine LR スケジューラ / `NEFTUNE_ALPHA = 5.0`（埋め込みノイズ正則化で反復ループ暗記を防止）
             - `LORA_PLUS_RATIO = 4.0`: `lora_B` の学習率を上げて tool 呼び出しの収束を早める倍率。`16.0` 以上に振ると
               tool call が `<|tool_call>` ではなく `<|turn>model{...}` というただの文字列に固まるので上げない
             - `USE_RSLORA`: 既定 `False`。rank を 64 以上に上げるときだけ検討する
             - `SFT_EPOCHS = 2.0`: 105 件超の教材を 3 周させると tool call の「形式」そのものを暗記し始めるので抑えめ
-            - `RUN_DPO` / `DPO_EPOCHS`: Stage 2（DPO）を回すか。DPO を掛けるのは **main だけ**です
-              （analyzer / verifier は SFT まで。選好データの実務価値は edit / run / NO_PATCH の判定にある）
+            - `RUN_DPO` / `DPO_EPOCHS`: Stage 2（DPO）を回すか。**既定は `False`（まずは歪みのない Stage 1 RFT-SFT アダプタで
+              評価確認し、解決トレースが増えてから `True` にするのが安全）**。DPO を掛けるのは **main だけ**です
             - `MAX_TOOL_CALLS = 45` / `MAX_TURNS = 60`: `submission/eval_config.yaml` と同じ予算を教材の user プロンプトに書き写す値。
               教材と実運用で budget がズレると「予算 80 前提の行動」を覚えてしまいます
 
@@ -325,12 +325,13 @@ def build_notebook() -> nbf.NotebookNode:
             ALPHA = 32                        #@param {type:"integer"}
             USE_RSLORA = False                #@param {type:"boolean"}
             LORA_PLUS_RATIO = 4.0             #@param {type:"number"}
+            NEFTUNE_ALPHA = 5.0               #@param {type:"number"}
             USE_4BIT = False                  #@param {type:"boolean"}
             LEARNING_RATE = "5e-5"            #@param {type:"string"}
-            MAX_LEN = 8192                    #@param {type:"integer"}
+            MAX_LEN = 10240                   #@param {type:"integer"}
             MAX_EXAMPLES = 200                #@param {type:"integer"}
             SFT_EPOCHS = 2.0                  #@param {type:"number"}
-            RUN_DPO = True                    #@param {type:"boolean"}
+            RUN_DPO = False                   #@param {type:"boolean"}
             DPO_EPOCHS = 1.0                  #@param {type:"number"}
             MAX_TOOL_CALLS = 45               #@param {type:"integer"}
             MAX_TURNS = 60                    #@param {type:"integer"}
@@ -366,8 +367,8 @@ def build_notebook() -> nbf.NotebookNode:
                 extra_lora_flags.append("--use_4bit")
             EXTRA_FLAGS = " ".join(extra_lora_flags)
 
-            print(f"BUILD_MODE={BUILD_MODE} roles={ROLES} adapters={ADAPTERS}")
-            print(f"precision={'4bit' if USE_4BIT else 'bf16 (H100/A100 80GB)'} EXTRA_FLAGS={EXTRA_FLAGS or '(none)'}")
+            print(f"BUILD_MODE={BUILD_MODE} roles={ROLES} adapters={ADAPTERS} RUN_DPO={RUN_DPO}")
+            print(f"precision={'4bit' if USE_4BIT else 'bf16 (A100/H100)'} MAX_LEN={MAX_LEN} NEFTUNE={NEFTUNE_ALPHA} EXTRA_FLAGS={EXTRA_FLAGS or '(none)'}")
             for role in ROLES:
                 print(f"  {role:8s} {DATA_BY_ROLE[role]} -> {OUT_DIR_BY_ROLE[role]}")
             """
@@ -399,8 +400,17 @@ def build_notebook() -> nbf.NotebookNode:
         _code(
             """
             #@title 4. Stage 1a — role ごとに教材を収集
-            import os
+            import subprocess
             from pathlib import Path
+
+
+            def run_stream(cmd: str) -> int:
+                proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+                return proc.wait()
+
 
             for role in ROLES:
                 # resolved 済み trace を main の RFT に足す（analyzer / verifier は gold 合成のみで十分）
@@ -412,7 +422,7 @@ def build_notebook() -> nbf.NotebookNode:
                        f"--max-tool-calls {MAX_TOOL_CALLS} --max-turns {MAX_TURNS} "
                        f"--output {DATA_BY_ROLE[role]}")
                 print("[collect]", cmd, flush=True)
-                if os.system(cmd) != 0:
+                if run_stream(cmd) != 0:
                     print(f"[stage1a] collect failed for role={role}（cell 5 はこの role を skip します）")
 
             for role in ROLES:
@@ -429,23 +439,16 @@ def build_notebook() -> nbf.NotebookNode:
             （`submission/adapters/main_lora` など）で、`train_lora.py` が保存時の `adapter_config.json` を
             本番名（`google/gemma-4-e4b-it-qat-w4a16-ct`）に書き換えてくれます。
 
-            ### cell 5 が必ず渡す値（tool call 形式を壊さないための下限）
+            ### cell 5 が必ず渡す値（tool call 形式と推論履歴整合を守る設定）
 
-            - `--lr 5e-5` — 4bit + LoRA+ で `1e-4` を当てると tool call / turn の特殊 token が飛ぶ
-            - `--max_len 8192` — 1 会話の token 上限。超えた末尾 turn は切り捨てる（H100 / A100 80GB 前提。L4/T4 は下げる）
-            - `--max_examples 200` — 教材の会話数上限。周回しすぎると tool call の「形式」だけ暗記する
-            - `USE_4BIT = False` のとき `EXTRA_FLAGS` は空（bf16）。`True` にすると `--use_4bit` が付き、
-              `USE_RSLORA` / `LORA_PLUS_RATIO` の分も一緒に渡ります
-
-            教材が無 role は `[skip]` で飛ばします（cell 4 が失敗しても止めずに続けられます）。
-            `train_lora.py` は学習前に `[data] sample supervised text:` として 1 件目を decode して out に
-            書き出すので、そこで `tool_calls` が壊れていなければ教材は使えます。
+            - `--lr 5e-5` + `--lr_scheduler cosine` + `--neftune_alpha 5.0` — 特殊 token を壊さず反復暗記を抑える
+            - `--max_len 10240` — 1 ステップの token 上限（長い会話は中間ターンを自動トリミングし、末尾の `edit_file` / `submit_patch` を必ず保持）
+            - `main` は過去ターンの思考を除去（`include_thoughts: false` 整合）、`analyzer` は `--keep_prior_thoughts`（`include_thoughts: true` 整合）
             """
         ),
         _code(
             """
             #@title 5. Stage 1b — LoRA 学習（role 順に main → analyzer → verifier）
-            import os
             from pathlib import Path
 
             for role in ROLES:
@@ -453,11 +456,13 @@ def build_notebook() -> nbf.NotebookNode:
                 if not Path(data_file).is_file() or Path(data_file).stat().st_size == 0:
                     print(f"[stage1b] [skip] 教材が無い: {data_file}")
                     continue
+                role_flags = "--keep_prior_thoughts" if role != "main" else ""
                 cmd = (f"python3 src/train/train_lora.py --data {data_file} --out_dir {out_dir} "
                        f"--r {R} --alpha {ALPHA} --lr {LEARNING_RATE} --epochs {SFT_EPOCHS} "
-                       f"--max_len {MAX_LEN} --max_examples {MAX_EXAMPLES} {EXTRA_FLAGS}")
+                       f"--neftune_alpha {NEFTUNE_ALPHA} "
+                       f"--max_len {MAX_LEN} --max_examples {MAX_EXAMPLES} {role_flags} {EXTRA_FLAGS}")
                 print("[sft]", cmd, flush=True)
-                if os.system(cmd) != 0:
+                if run_stream(cmd) != 0:
                     print(f"[stage1b] train_lora failed for role={role}（cell 6 の DPO は main だけ試します）")
             """
         ),
@@ -469,25 +474,19 @@ def build_notebook() -> nbf.NotebookNode:
             同じ task の gold 合成 SFT または resolved 済み trace を chosen に作ります（`--role main`）。
             生成先は `data/dpo_pairs_main.jsonl`。
 
-            - **analyzer / verifier には DPO を掛けません。** 選好データで伸ばせる判断は
-              「edit / run / NO_PATCH をどれで出すか」と「途中でやめるな」という main の挙動だからです。
-              analyzer / verifier は cell 5 の SFT までが本番です
-            - `RUN_DPO = False`、`results/` が無い、ペアが 0 件、Stage 1 の adapter が無い — いずれも `[skip]` で止めます
-            - `--resume_from` で Stage 1 の `main_lora` に上から掛けるので、adapter は 1 本のまま更新されます
-            - LoRA の形は cell 3 の `EXTRA_FLAGS` をそのまま渡して Stage 1 と揃えます
-              （`--use_4bit` を片方だけ付けると PEFT は読み込みに失敗します）
-            - `train_dpo.py` は自前の `--max_len`（既定 4096）で切り捨てます。chosen / rejected が
-              途中で切れていると感じたら cell 6 のコマンドに `--max_len 8192` を足してください（OOM したら下げる）
+            - **既定は `RUN_DPO = False` です。** まずは Stage 1 の `main_lora` + `analyzer_lora` で評価を通し、
+              DPO を試す場合は cell 3 で `RUN_DPO = True` に切り替えてください
+            - `build_dpo_pairs.py` は `edit_file` 同士の対比や検証後ループに対する `submit_patch` を chosen に含め、
+              `train_dpo.py` は長さ正規化 DPO（`sigmoid_norm`）と過去思考除去で `submit_patch` 抑制を防ぎます
             """
         ),
         _code(
             """
-            #@title 6. Stage 2 — DPO（main だけ / 解決しなかった実 trace を rejected に）
-            import os
+            #@title 6. Stage 2 — DPO（main だけ / RUN_DPO=True のときのみ実行）
             from pathlib import Path
 
             if not (RUN_DPO and "main" in ROLES):
-                print("[stage2] [skip] RUN_DPO=False か BUILD_MODE に main が無い")
+                print("[stage2] [skip] RUN_DPO=False（Stage 1 RFT-SFT アダプタをそのまま使用します）")
             else:
                 out_dir, dpo_pairs = OUT_DIR_BY_ROLE["main"], DPO_BY_ROLE["main"]
                 if not Path(out_dir).exists():
@@ -498,14 +497,14 @@ def build_notebook() -> nbf.NotebookNode:
                     build = (f"python3 src/collect/build_dpo_pairs.py --results {RESULTS_DIR} "
                              f"--tasks {TASKS_JSONL} --role main --output {dpo_pairs}")
                     print("[dpo]", build, flush=True)
-                    if os.system(build) != 0:
+                    if run_stream(build) != 0:
                         print("[stage2] build_dpo_pairs failed")
                     if Path(dpo_pairs).is_file() and Path(dpo_pairs).stat().st_size > 0:
                         train = (f"python3 src/train/train_dpo.py --data {dpo_pairs} "
                                  f"--resume_from {out_dir} --out_dir {out_dir} "
-                                 f"--r {R} --alpha {ALPHA} --epochs {DPO_EPOCHS} {EXTRA_FLAGS}")
+                                 f"--r {R} --alpha {ALPHA} --max_len {MAX_LEN} --epochs {DPO_EPOCHS} {EXTRA_FLAGS}")
                         print("[dpo]", train, flush=True)
-                        if os.system(train) != 0:
+                        if run_stream(train) != 0:
                             print("[stage2] train_dpo failed")
                     else:
                         print(f"[stage2] [skip] 選好ペアが 0 件: {dpo_pairs}")

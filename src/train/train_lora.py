@@ -41,6 +41,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
@@ -80,17 +81,29 @@ def parse_args() -> argparse.Namespace:
                    help="LoRA+ lr multiplier for lora_B params (e.g. 16.0; 1.0 = standard LoRA)")
 
     # optimisation
-    p.add_argument("--max_len", type=int, default=4096)
-    p.add_argument("--epochs", type=float, default=3.0)
+    p.add_argument("--max_len", type=int, default=10240,
+                   help="per-example token cap (10240 fits A100 40GB bf16; step-SFT middle-trims older turns)")
+    p.add_argument("--epochs", type=float, default=2.0)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-5,
                    help="5e-5 default: 1e-4 on a 4-bit base with LoRA+ corrupted tool_call tokens on ~105 trajectories")
+    p.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "linear"],
+                   help="cosine (default) stabilises special tool_call tokens late in training")
     p.add_argument("--warmup_steps", type=int, default=20)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--neftune_alpha", type=float, default=5.0,
+                   help="NEFTune uniform embedding noise scale during train() (0 disables; zero inference cost)")
+    p.add_argument("--action_loss_weight", type=float, default=1.25,
+                   help="loss multiplier on edit_file/write_file/submit_patch steps to counter read_file skew")
 
-    # which tokens are supervised
+    # which tokens are supervised & train/inference context alignment
+    p.add_argument("--step_sft", action="store_true", default=True,
+                   help="encode one example per assistant turn with middle-turn trimming (preserves submit_patch)")
+    p.add_argument("--no_step_sft", dest="step_sft", action="store_false")
+    p.add_argument("--keep_prior_thoughts", action="store_true", default=False,
+                   help="keep prior assistant reasoning_content in history (enable for analyzer; False matches main include_thoughts=false)")
     p.add_argument("--mask_system", action="store_true", default=True)
     p.add_argument("--train_on_system", dest="mask_system", action="store_false")
     p.add_argument("--train_on_observations", action="store_true",
@@ -199,24 +212,34 @@ def render_message(tokenizer: AutoTokenizer, message: Message) -> str:
     return text + "<tool_call>\n" + json.dumps(payload, ensure_ascii=False) + "\n</tool_call>\n"
 
 
-def _render_conversation(tokenizer: AutoTokenizer, messages: Conversation) -> str:
+def _strip_thought_fields(message: Message) -> Message:
+    """Remove `reasoning_content` / `reasoning` from prior assistant turns to match `include_thoughts: false`."""
+    if message.get("role") not in ASSISTANT_ROLES:
+        return message
+    return {k: v for k, v in message.items() if k not in ("reasoning_content", "reasoning")}
+
+
+def _render_conversation(tokenizer: AutoTokenizer, messages: Conversation,
+                         preserve_thinking: bool = True,
+                         add_generation_prompt: bool = False) -> str:
     """Render a whole conversation with the model's chat template.
 
     Gemma 4 serialises `tool_calls` only when the template sees the turns around the call. Handing
     it `[message]` takes a template branch without the call header, and the adapter then answers
-    `<|tool_call>` with literal `<|turn>model{...}` garbage. Passing `enable_thinking=True` and
-    `preserve_thinking=True` ensures `<|think|>` and `<|channel>thought...<channel|>` match vLLM.
+    `<|tool_call>` with literal `<|turn>model{...}` garbage.
     """
     try:
         return tokenizer.apply_chat_template(
             messages,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
             tokenize=False,
             enable_thinking=True,
-            preserve_thinking=True,
+            preserve_thinking=preserve_thinking,
         )
     except TypeError:
-        return tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+        return tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt, tokenize=False
+        )
 
 
 def is_supervised(role: str | None, args: argparse.Namespace) -> bool:
@@ -226,6 +249,96 @@ def is_supervised(role: str | None, args: argparse.Namespace) -> bool:
     if role == "system":
         return not args.mask_system
     return role == "tool" and args.train_on_observations
+
+
+def _step_loss_weight(message: Message, args: argparse.Namespace) -> float:
+    """Upweight decisive editing / submission turns so `read_file` frequency does not dominate SFT."""
+    boost = float(getattr(args, "action_loss_weight", 1.0) or 1.0)
+    if boost == 1.0:
+        return 1.0
+    calls = message.get("tool_calls") or []
+    names = {(c.get("function") or {}).get("name") or c.get("name") for c in calls}
+    if names & {"edit_file", "write_file", "submit_patch"}:
+        return boost
+    return 1.0
+
+
+def encode_step_examples(tokenizer: AutoTokenizer, messages: Conversation,
+                         args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Encode one training example per assistant turn, matching vLLM/ADK inference context.
+
+    Why step-level SFT fixes both infinite loops and `submit_patch` omission:
+      1. In Gemma 4's Jinja template, `loop.index0 > last_user_idx` keeps thoughts on all prior
+         assistant turns unless `reasoning_content` is stripped. Stripping prior thoughts here
+         matches `sampling.yaml` (`include_thoughts: false`) token-for-token, including the
+         `<|channel>thought\\n` prompt prefix emitted after `<tool_response|>`.
+      2. Trajectory-level right-truncation (`input_ids[:max_len]`) silently chopped off the tail of
+         long multi-turn episodes — the exact turns containing `edit_file`, `pytest`, and
+         `submit_patch`. Here we middle-trim oldest `(assistant, tool)` turns after `[system, user]`
+         so terminal `edit_file` and `submit_patch` turns are 100% preserved.
+    """
+    norm = [_normalize_tool_calls(m) for m in messages]
+    keep_prior = bool(getattr(args, "keep_prior_thoughts", False))
+    bos_id = tokenizer.bos_token_id
+    examples: list[dict[str, Any]] = []
+
+    for step_idx, target_msg in enumerate(norm):
+        if target_msg.get("role") not in ASSISTANT_ROLES or step_idx == 0:
+            continue
+        hist = [
+            m if (keep_prior or m.get("role") not in ASSISTANT_ROLES) else _strip_thought_fields(m)
+            for m in norm[:step_idx]
+        ]
+        # Middle-trim oldest `(assistant, tool...)` groups after `[system, user]` to fit `args.max_len`
+        trimmed = list(hist)
+        prompt_ids: list[int] = []
+        full_ids: list[int] = []
+        while True:
+            try:
+                prompt_text = _render_conversation(
+                    tokenizer, trimmed, preserve_thinking=keep_prior, add_generation_prompt=True
+                )
+                full_text = _render_conversation(
+                    tokenizer, trimmed + [target_msg], preserve_thinking=keep_prior, add_generation_prompt=False
+                )
+                if not full_text.startswith(prompt_text):
+                    prompt_text = _render_conversation(
+                        tokenizer, trimmed, preserve_thinking=keep_prior, add_generation_prompt=False
+                    )
+            except Exception:
+                prompt_text = "".join(render_message(tokenizer, m) for m in trimmed)
+                full_text = prompt_text + render_message(tokenizer, target_msg)
+
+            prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+            full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+            if len(full_ids) <= args.max_len - 1 or len(trimmed) <= 2:
+                break
+            drop_end = 3
+            while drop_end < len(trimmed) and trimmed[drop_end].get("role") == "tool":
+                drop_end += 1
+            if drop_end >= len(trimmed):
+                break
+            trimmed = trimmed[:2] + trimmed[drop_end:]
+
+        if not full_ids or len(full_ids) <= len(prompt_ids) or full_ids[:len(prompt_ids)] != prompt_ids:
+            continue
+        comp_ids = full_ids[len(prompt_ids):]
+        input_ids = prompt_ids + comp_ids
+        labels = [IGNORE] * len(prompt_ids) + comp_ids
+        if bos_id is not None and input_ids and input_ids[0] != bos_id:
+            input_ids = [bos_id] + input_ids
+            labels = [IGNORE] + labels
+        input_ids = input_ids[:args.max_len]
+        labels = labels[:args.max_len]
+        if not any(lbl != IGNORE for lbl in labels):
+            continue
+        examples.append({
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": [1] * len(input_ids),
+            "weight": _step_loss_weight(target_msg, args),
+        })
+    return examples
 
 
 def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
@@ -277,15 +390,27 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
 
 
 def build_dataset(tokenizer: AutoTokenizer, conversations: list[Conversation], args: argparse.Namespace) -> Dataset:
-    rows: list[Example] = []
+    rows: list[dict[str, Any]] = []
+    use_step_sft = bool(getattr(args, "step_sft", True)) and not getattr(args, "train_on_observations", False)
+    dropped = 0
     for messages in conversations:
-        encoded = encode_conversation(tokenizer, messages, args)
-        if encoded is not None:
-            rows.append(encoded)
+        if use_step_sft:
+            step_rows = encode_step_examples(tokenizer, messages, args)
+            if step_rows:
+                rows.extend(step_rows)
+            else:
+                dropped += 1
+        else:
+            encoded = encode_conversation(tokenizer, messages, args)
+            if encoded is not None:
+                rows.append(encoded)
+            else:
+                dropped += 1
 
     tokens = [sum(1 for label in row["labels"] if label != IGNORE) for row in rows]
-    print(f"[data] encoded {len(rows)} conversations ({len(conversations) - len(rows)} dropped: no supervised tokens), "
-          f"{sum(tokens) / max(1, len(rows)):.0f} supervised tokens/example")
+    mode_tag = f"step-SFT (keep_prior_thoughts={getattr(args, 'keep_prior_thoughts', False)})" if use_step_sft else "trajectory-SFT"
+    print(f"[data] {mode_tag}: encoded {len(rows)} examples from {len(conversations)} conversations "
+          f"({dropped} conversations dropped), {sum(tokens) / max(1, len(rows)):.0f} supervised tokens/example")
     if not rows:
         raise SystemExit("[error] every example collapsed to zero supervised tokens")
 
@@ -434,18 +559,40 @@ def chunked_causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor, chunk_siz
     return total_loss / valid_tokens
 
 
-def training_step(model, example: Example, index: int, device: torch.device,
+def register_neftune_hook(model, alpha: float):
+    """Attach NEFTune uniform noise hook to input embeddings during `model.train()` (Jain et al., 2024)."""
+    if alpha <= 0:
+        return None
+    emb = model.get_input_embeddings()
+    if emb is None:
+        return None
+
+    def _hook(module, _inputs, output):
+        if not module.training or not torch.is_tensor(output):
+            return output
+        dims = float(output.size(1) * output.size(2)) if output.dim() >= 3 else float(output.numel())
+        mag = alpha / math.sqrt(max(1.0, dims))
+        noise = torch.empty_like(output).uniform_(-mag, mag)
+        return output + noise
+
+    print(f"[train] NEFTune enabled: alpha={alpha:g}")
+    return emb.register_forward_hook(_hook)
+
+
+def training_step(model, example: dict[str, Any], index: int, device: torch.device,
                   collator: Collator, args: argparse.Namespace) -> float | None:
     """Forward one example and accumulate its gradient; return the raw loss, or None on OOM.
 
     A trajectory that does not fit is dropped instead of killing a whole afternoon run.
     """
-    batch = {key: value.to(device) for key, value in collator([example]).items()}
+    weight = float(example.get("weight", 1.0))
+    clean_ex = {k: example[k] for k in ("input_ids", "labels", "attention_mask")}
+    batch = {key: value.to(device) for key, value in collator([clean_ex]).items()}
     labels = batch.pop("labels")
     try:
         logits = model(**batch).logits
         loss = chunked_causal_lm_loss(logits, labels)
-        (loss / args.grad_accum).backward()
+        (loss * weight / args.grad_accum).backward()
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
@@ -462,37 +609,48 @@ def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Name
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = build_optimizer(model, args)
     total_steps = int(max(1, len(dataset) // args.grad_accum) * args.epochs)
-    scheduler = get_linear_schedule_with_warmup(optimizer, args.warmup_steps, total_steps)
+    warmup = min(args.warmup_steps, max(1, total_steps // 5))
+    sched_name = getattr(args, "lr_scheduler", "cosine")
+    if sched_name == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
+    else:
+        scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
+    print(f"[train] scheduler={sched_name}, warmup_steps={warmup}, total_steps={total_steps}")
     device = torch.device(next(model.parameters()).device)
     collator = Collator(tokenizer)
+    neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
 
     model.train()
     global_step, running_loss = 0, 0.0
-    for epoch in range(math.ceil(args.epochs)):
-        order = list(range(len(dataset)))
-        random.shuffle(order)
-        optimizer.zero_grad(set_to_none=True)
-
-        for step, index in enumerate(order):
-            loss = training_step(model, dataset[index], index, device, collator, args)
-            if loss is None:
-                continue  # OOM: the accumulation window simply stays short
-            running_loss += loss
-            if (step + 1) % args.grad_accum:
-                continue
-
-            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
+    try:
+        for epoch in range(math.ceil(args.epochs)):
+            order = list(range(len(dataset)))
+            random.shuffle(order)
             optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-            if global_step % args.log_every:
-                continue
-            avg = running_loss / (args.log_every * args.grad_accum)
-            running_loss = 0.0
-            print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
-                  f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
-                  f"mem {torch.cuda.max_memory_allocated() / 1024**3:.1f} GiB")
+
+            for step, index in enumerate(order):
+                loss = training_step(model, dataset[index], index, device, collator, args)
+                if loss is None:
+                    continue  # OOM: the accumulation window simply stays short
+                running_loss += loss
+                if (step + 1) % args.grad_accum:
+                    continue
+
+                torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                if global_step % args.log_every:
+                    continue
+                avg = running_loss / (args.log_every * args.grad_accum)
+                running_loss = 0.0
+                print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
+                      f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
+                      f"mem {torch.cuda.max_memory_allocated() / 1024**3:.1f} GiB")
+    finally:
+        if neftune_handle is not None:
+            neftune_handle.remove()
 
 
 # ------------------------------------------------------------------------------------ saving

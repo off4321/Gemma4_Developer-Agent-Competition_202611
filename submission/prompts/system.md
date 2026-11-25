@@ -83,16 +83,19 @@ diff that a hidden test suite must pass.
      `Source path ... not found` -> wrong file; `find . -maxdepth 4 -name "*<name>*"` to locate it.
    - **No blind edit loops**: NEVER call `edit_file` more than twice in a row on the same file
      without re-reading exact lines first.
-4. **Verify before `submit_patch` (mandatory after your final edit)**:
+4. **Verify before `submit_patch` (mandatory after your final edit — then IMMEDIATELY submit)**:
    NEVER call `submit_patch` immediately after `edit_file`/`write_file` without running
    `run_command` after your final edit, and NEVER call `submit_patch` when `git diff` is empty.
-   Run all three checks via `run_command`:
+   Run all checks in ONE concise `run_command` (always cap output so your 32k context window never overflows):
    - Syntax & non-empty diff check: `python3 -m py_compile <modified_file.py> && git diff --check && git diff --stat`.
-   - Targeted existing test ONLY: `pytest <single_test_file.py> -k <keyword> -q --tb=short`.
+   - Targeted existing test ONLY: `pytest <single_test_file.py> -k <keyword> -q --tb=short | tail -n 40`.
      **NEVER run bare `pytest` or `pytest tests/` across the entire test suite** — unrelated test
      files may import optional packages (e.g., `dirty_equals`) not needed by your target module.
    - Requirement & edge-case check: run `python3 /tmp/repro.py` (or `python3 -c "..."`) directly
      testing every requirement, error case, and boundary condition from the problem statement.
+   - **STOP LOOPING ONCE VERIFIED**: As soon as `edit_file` succeeded (`status: ok`) and your
+     `py_compile` + targeted test command passed, **your very next tool call MUST be `submit_patch`**.
+     NEVER re-read, re-apply the same `edit_file`, or re-run `py_compile` in a loop!
 5. **Match the spec literally.** Exact exception type, exact message text, exact status code,
    exact signature/default value. Hidden tests assert those strings.
 6. **Stay in the loop.** Never repeat an identical tool call. Never narrate without acting:

@@ -224,3 +224,23 @@ def test_step_pairs_contain_single_assistant_turn_without_tool_observations(tmp_
         assert p["prompt"][-1]["role"] in ("user", "tool")
     # Because read_file already contained EDIT_ARGS["old_string"], step_edit_error teaches the exact gold edit_file
     assert step_pairs[0]["chosen"][0]["tool_calls"][0]["function"]["name"] == "edit_file"
+
+
+def test_step_pairs_teach_submit_patch_after_verified_edit_and_real_diff_on_noop_edit(tmp_path: Path) -> None:
+    noop_err = {"status": "error", "error_type": "FileEditError",
+                "error_message": "No changes to apply. old_string and new_string are identical."}
+    loop_steps = [
+        step("noop edit", [call("edit_file", {**EDIT_ARGS, "new_string": EDIT_ARGS["old_string"]}, "e0")], noop_err),
+        step("real edit", [call("edit_file", EDIT_ARGS, "e1")], OK),
+        step("verify", [call("run_command", {"command": "python3 -m py_compile pkg/a.py"}, "c1")], OK),
+        step("redundant reread", [call("read_file", {"filepath": "pkg/a.py"}, "r2")], OK),
+    ]
+    write_trace(tmp_path, "fastapi_loop", "a", loop_steps)
+    write_task_results(tmp_path, [{"instance_id": "fastapi_loop", "resolved": False, "agent_patch_size": 120}])
+    grouped = dpo._load_traces([tmp_path], "main")
+    step_pairs = dpo.build_step_pairs(grouped, {"fastapi_loop": gold()}, max_pairs_per_task=6)
+    by_reason = {p["meta"]["rejection_reason"]: p for p in step_pairs}
+    assert "step_edit_error" in by_reason
+    assert by_reason["step_edit_error"]["chosen"][0]["tool_calls"][0]["function"]["name"] == "edit_file"
+    assert "step_missing_submit" in by_reason
+    assert by_reason["step_missing_submit"]["chosen"][0]["tool_calls"][0]["function"]["name"] == "submit_patch"

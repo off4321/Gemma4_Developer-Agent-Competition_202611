@@ -5,16 +5,15 @@
 # -> `thinking_budget` / `include_thoughts` MUST live under `thinking_config`.
 #
 # `max_output_tokens` caps ONE assistant turn (thinking + tool_call combined on vLLM).
-# It MUST be strictly larger than `thinking_budget` with several thousand tokens of headroom;
-# setting max_output_tokens=1024 < thinking_budget=2048 caused thoughts and `<|tool_call>`
-# tags to truncate mid-generation. 8192 total with thinking_budget=1536 leaves ~6656 tokens
-# for `edit_file` / `write_file` payloads while capping runaway reasoning early.
+# Because vLLM enforces `prompt_tokens + max_tokens <= 32768`, keeping `max_output_tokens` at
+# 5120 (instead of 8192) expands usable multi-turn input context from 24.5k to 27.6k tokens while
+# still leaving ~3840 tokens after `thinking_budget: 1280` for `< 60 line` `edit_file` payloads.
 temperature: 0.2
 top_p: 0.95
-frequency_penalty: 0.3          # stop repetitive tool_call / text loops within a single turn
-max_output_tokens: 8192
+frequency_penalty: 0.1          # mild anti-repetition without penalising verbatim old_string indentation
+max_output_tokens: 5120
 thinking_config:
-  thinking_budget: 1536
+  thinking_budget: 1280
   include_thoughts: false       # HARNESS_README §2.4: thinking_budget > 0 enables reasoning on
                                 # every turn while stripping prior turns' `<|channel>thought` from history
   # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm
