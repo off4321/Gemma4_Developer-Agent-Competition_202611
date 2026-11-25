@@ -84,7 +84,10 @@ def _find_config(source: Path, names: tuple[str, ...]) -> list[Path]:
 
 
 def _is_vcs_artifact(rel: Path) -> bool:
-    return any(part.startswith(".git") for part in rel.parts)
+    if any(part.startswith(".git") for part in rel.parts):
+        return True
+    # Strip DPO reference/checkpoint subdirectories (`adapters/<name>/ref`, `_checkpoints`)
+    return len(rel.parts) >= 3 and rel.parts[0] == "adapters" and rel.parts[2] in {"ref", "_checkpoints"}
 
 
 def _iter_package_files(source: Path) -> list[Path]:
@@ -264,8 +267,12 @@ def _scan_adapter_payloads(source: Path, ck: Checker) -> tuple[set[str], int]:
         names.add(loose.stem)
         ck.warn(f"loose adapter weight {loose.name}: prefer adapters/<name>/adapter_model.safetensors")
     for stray in adapters_dir.rglob("*"):
-        if stray.is_file() and stray.suffix.lower() not in ALLOWED_SUBMISSION_EXTENSIONS:
-            ck.error(f"disallowed file under adapters/: {stray.relative_to(source)}")
+        if stray.is_file():
+            rel_stray = stray.relative_to(source)
+            if _is_vcs_artifact(rel_stray):
+                continue
+            if stray.suffix.lower() not in ALLOWED_SUBMISSION_EXTENSIONS:
+                ck.error(f"disallowed file under adapters/: {rel_stray}")
     return names, max_rank
 
 

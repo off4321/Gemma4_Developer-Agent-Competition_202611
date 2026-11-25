@@ -515,10 +515,17 @@ def rewrite_adapter_config(args: argparse.Namespace) -> None:
 
 
 def save_adapter(model, args: argparse.Namespace) -> None:
-    """Write safetensors only: the submission validator rejects a leftover pytorch_model.bin."""
+    """Write safetensors only and strip DPO artifacts (`ref/`, `_checkpoints/`)."""
+    import shutil
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(args.out_dir, safe_serialization=True)
+    try:
+        model.save_pretrained(args.out_dir, safe_serialization=True, selected_adapters=["default"])
+    except TypeError:
+        model.save_pretrained(args.out_dir, safe_serialization=True)
+    for leftover_dir in ("ref", "_checkpoints"):
+        shutil.rmtree(out_dir / leftover_dir, ignore_errors=True)
     rewrite_adapter_config(args)
     for junk in out_dir.glob("*.bin"):
         junk.unlink()
