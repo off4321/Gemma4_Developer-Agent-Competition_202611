@@ -1,18 +1,37 @@
 # ============================================================================
-# Root agent config (SequentialAgent 3-stage pipeline).
-# Contract: HARNESS_README.md §2.2 / §2.3 / §3.2 (single declared model rule)
-# Stage 1 (`code_analyzer_agent`) -> `localization_plan` (read-only explore)
-# Stage 2 (`coder_agent`)         -> `impl_report`       (edit/write + verify)
-# Stage 3 (`submitter_agent`)     -> `submit_patch()`    (audit diff + submit)
+# Root agent config (Hybrid Base + Specialized Analyzer LoRA).
+# Contract: HARNESS_README.md §2.2 / §3.2 (single declared model rule)
+# - Root coder runs on base `gemma-4-e4b-it-qat-w4a16-ct` (no `main_lora`),
+#   preserving native multi-step reasoning, traceback debugging, and valid
+#   `<|tool_call>` formatting across long turns and continuation nudges.
+# - Exploration is isolated in `code_analyzer_agent` (`adapter: analyzer_lora`,
+#   `skip_summarization: true`), which localizes files/lines/tests in ~18s
+#   without polluting the root 32k context window.
 # ============================================================================
-agent_class: SequentialAgent
-name: gemma_e4b_developer_pipeline
-description: >-
-  Sequential SWE resolution pipeline separating read-only localization,
-  minimal patch implementation and verification, and final diff submission.
-sub_agents:
-  - config_path: sub_agents/code_analyzer.yaml
-  - config_path: sub_agents/coder.yaml
-  - config_path: sub_agents/submitter.yaml
-  # keep verifier commented out until adapters/verifier_lora/ exists
-  # - config_path: sub_agents/verifier.yaml
+name: gemma_e4b_developer_agent
+model: gemma-4-e4b-it-qat-w4a16-ct
+instruction: !include prompts/system.md
+tools:
+  # execution / lifecycle
+  - run_command
+  - get_status
+  - submit_patch
+  # workspace file tools
+  - read_file
+  - edit_file
+  - write_file
+  # code intelligence
+  - get_code_neighbors
+  - search_similar_code
+  - get_code_subgraph
+  # isolated read-only explorer (trained analyzer_lora)
+  - agent_tool:
+      config_path: sub_agents/code_analyzer.yaml
+      skip_summarization: true
+  # keep verifier commented out
+  # - agent_tool:
+  #     config_path: sub_agents/verifier.yaml
+  #     skip_summarization: true
+skills:
+  - skills/swe-guard
+generate_content_config: !include configs/sampling.yaml

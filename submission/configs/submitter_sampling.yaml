@@ -1,7 +1,0 @@
-# Deterministic generation config for Stage 3 (`submitter_agent`).
-temperature: 0.1
-top_p: 0.9
-max_output_tokens: 2048
-thinking_config:
-  thinking_budget: 512
-  include_thoughts: true
