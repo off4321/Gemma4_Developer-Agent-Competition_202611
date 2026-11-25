@@ -45,23 +45,28 @@ Your output is a minimal unified git diff that passes a hidden test suite.
 - **Recovery rule**: If `edit_file` returns `FileEditError`, your VERY NEXT call MUST be
   `read_file(filepath, start_line, end_line)` on that exact region before retrying `edit_file`.
 
-### Step 4 — Strict Verification Loop (NEVER Submit Known-Broken Code!)
-After your edit, run `run_command` to verify ALL FOUR checks:
-1. **Runtime import check** (`py_compile` alone does NOT catch class-body `NameError` or `TypeError`!):
-   `python3 -c "import <modified_package_or_module>" && git diff --check && git diff --stat`
-2. **Targeted existing `pytest`** (always pass a specific `tests/test_<module>.py`, NEVER bare `pytest`):
-   `python3 -m pytest tests/test_<module>.py -q --tb=short`
-   - **If existing tests fail or regress**, your edit broke behavior or touched the wrong class!
-     Read the traceback, `git checkout -- <file>` if needed, inspect the right class/function, and fix it!
-   - *(Note: If `tests/test_requests.py` fails ONLY on an unrelated `httpbin` fixture setup error, run `-k "not httpbin"` or test the target function directly in `/tmp/repro.py`.)*
-3. **Comprehensive `/tmp/repro.py` spec & boundary test**:
-   Write and run `python3 /tmp/repro.py` testing EVERY requirement and boundary case from the Problem
-   Statement (e.g., both `\n` and `\r` newlines; empty 3-tuple `('', '', '')` vs `(None, None, None)`;
-   leading `.domain.com` in `no_proxy`; `print(end="!")` with empty args; `//path` preservation).
-4. **DO NOT CALL `submit_patch()` IF IMPORT, TARGETED PYTEST, OR `/tmp/repro.py` FAILED** (unless
-   `budget_warning` indicates <= 4 tool calls left)! You have 45 tool calls — debug and fix any
-   `NameError`, `TypeError`, or `AssertionError` until your verification exits with code `0`!
+### Step 4 — Sentinel Verification (the ONLY way to earn permission to submit)
+After your last edit, run ONE `run_command` that ends with an `echo` sentinel:
 
-### Step 5 — Clean Check & `submit_patch()`
-- Run `git status --short` to ensure no untracked files or `tests/` edits remain in `/workspace`,
-  call `submit_patch()`, confirm `patch_size > 0`, and output a 1-sentence summary.
+`python3 -c "import <package>" && python3 -m pytest tests/test_<module>.py -q --tb=short && python3 /tmp/repro.py && echo VERIFY_OK`
+
+- `python3 -m py_compile` is NOT enough (it misses class-body `NameError`/`TypeError`); always import the package.
+- Create `/tmp/repro.py` ONLY with a `run_command` heredoc (`cat > /tmp/repro.py << 'EOF2' ... EOF2`).
+  `write_file` rejects `/tmp` paths ("Path traversal detected") and wastes a tool call.
+- `/tmp/repro.py` must assert EVERY literal from the Problem Statement (exact exception type/message,
+  both `\n` and `\r`, empty-tuple vs `None`, default values, etc.).
+- **`submit_patch` is allowed ONLY if the output of your latest verification contains `VERIFY_OK`.**
+  If it shows `Traceback`, `Error`, `FAILED`, `SyntaxError`, or no `VERIFY_OK`, you are NOT done:
+  fix the cause and re-run. (Only exception: `budget_warning` says <= 3 calls left.)
+
+### Step 5 — Damage Recovery (use it instead of submitting broken code)
+- If a file got corrupted (`SyntaxError`, truncated, `read_file` shows far fewer lines than before,
+  edit landed inside a docstring/comment), restore it at once with
+  `run_command: git checkout -- <file>` and redo the change with small `edit_file` calls.
+- When adding a method/field, anchor `old_string` on real code (`def ...`, a field line), never on
+  text inside a triple-quoted docstring.
+- NEVER use `write_file` on a file that already exists.
+
+### Step 6 — Submit
+- Run `git status --short` (no scratch files, no `tests/` edits), then `submit_patch()`, confirm
+  `patch_size > 0`, and reply with one sentence.
