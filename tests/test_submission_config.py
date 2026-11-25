@@ -97,8 +97,8 @@ def test_generation_configs_are_legal_and_well_sized() -> None:
 
 def test_eval_config_budget_supports_hybrid_verifier() -> None:
     eval_cfg = load("eval_config.yaml")["evaluation"]
-    assert eval_cfg["max_tool_calls"] == 65
-    assert eval_cfg["max_turns"] == 90
+    assert eval_cfg["max_tool_calls"] == 50
+    assert eval_cfg["max_turns"] == 75
     assert eval_cfg["max_time_minutes"] <= 60
 
 

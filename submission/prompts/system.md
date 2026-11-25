@@ -21,8 +21,7 @@ Your output is a minimal unified git diff that passes a hidden test suite.
 - Treat its report as candidate locations ONLY; verify the true root cause directly in source code.
 
 ### Step 2 — Read Target Files, Callers, Sibling Conventions, AND Existing Tests
-- **Always pass explicit `start_line` and `end_line`** (`1 <= start_line <= end_line`, <= 150 lines)
-  to `read_file`. Read **lines `1-60`** (imports & helpers) AND the target function/class lines.
+- **32k Context Budget Guard**: Do NOT read huge files (e.g., `console.py`, `applications.py`) in 8–10 consecutive slices! Grep exact line numbers first (`grep -rn "<symbol>" <file>`), then pass explicit `start_line` and `end_line` (`1 <= start_line <= end_line`) to `read_file` to read ONLY **lines `1-60`** (imports & helpers) plus the target **100–140 line window** around the matched function/class.
 - **Read existing test files (`tests/test_*.py`)** before editing to learn exact test assertions and helpers.
 - **Sibling Convention Rule (CRITICAL)**: NEVER invent error message wording, warning classes, or decorators
   from scratch! Before writing `raise ValueError(...)` or deprecation logic:
@@ -36,19 +35,19 @@ Your output is a minimal unified git diff that passes a hidden test suite.
   (e.g., `FastAPI.__init__` -> `APIRouter` -> `APIRoute`; `applications.py` -> `openapi/docs.py`; `_types.py` + callers;
   `_encode_files` vs `_encode_params`; host port-appending order and `.domain` stripping in proxy matching).
 
-### Step 3 — Apply Minimal, Idiomatic Edits (`edit_file` / `write_file`)
+### Step 3 — Apply Minimal, Idiomatic Edits (`edit_file` Only for Existing Files)
+- **Existing files MUST ONLY be edited with `edit_file`**: NEVER modify existing repository files via `sed -i`, `cat >`, `python3 -c "...write..."`, or `write_file` (`write_file` is strictly for brand-new files required by the spec).
 - Copy 3–6 verbatim lines from your latest `read_file` output into `old_string` (never escape `_` as `\_`,
   never reuse stale pre-edit lines, and anchor `old_string` on real code statements—NEVER inside a docstring).
-- Use `write_file` ONLY for brand-new files required by the spec, NEVER on existing files.
 - **Python / Pydantic Class-Scope Pitfall**: Inside `class Foo(BaseModel):`, `Annotated[..., AfterValidator(fn)]`
   executes BEFORE methods defined below it (`NameError`), and `AfterValidator(fn)` requires a **1-argument
   function `def fn(v: ...) -> ...:` defined at module level ABOVE the class** (returning `v`).
-- **2-Strike Recovery & Damage Control**:
+- **2-Strike / 3-Strike Recovery & Damage Control**:
   - If `edit_file` returns `FileEditError`, your VERY NEXT call MUST be `read_file(filepath, start_line, end_line)`.
-  - If `edit_file` fails TWICE on the same region, inspect exact numbered lines via
+  - If `edit_file` fails 2 times on a region, inspect exact numbered lines via
     `run_command: nl -ba <filepath> | sed -n 'X,Yp'`.
-  - If a file gets corrupted (`SyntaxError`, broken docstring, truncated lines), immediately restore it with
-    `run_command: git checkout -- <file>` and re-apply cleanly.
+  - If `edit_file` fails 3 times or causes any `SyntaxError` (or broken docstring / truncated lines), immediately run
+    `run_command: git checkout -- <file>` to reset cleanly and re-apply.
 
 ### Step 4 — Sentinel Verification (`PYTHONPATH=src:.` + `VERIFY_OK`)
 Always prefix Python/pytest commands with `PYTHONPATH=src:.` (so `src/`-layout packages like `requests` import

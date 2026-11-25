@@ -9,6 +9,6 @@
 # `build_submission.py` warns below max_turns=50 / max_tool_calls=40.
 evaluation:
   timeout_seconds: 300          # per-command timeout (Phase 1)
-  max_tool_calls: 65            # analyzer (~5) + root multi-file read/edit/test + verifier (~3) + retry
+  max_tool_calls: 50            # tight 50-call budget: analyzer + targeted edits/tests + verifier + retry
   max_time_minutes: 45          # agent-loop wall clock only (container setup excluded)
-  max_turns: 90                 # room for analyzer + multi-file edits + verifier audit + retry
+  max_turns: 75                 # tight 75-turn budget: room for analyzer + edits + verifier audit + retry
