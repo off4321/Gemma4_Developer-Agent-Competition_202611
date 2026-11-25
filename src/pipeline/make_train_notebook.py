@@ -161,7 +161,7 @@ def build_notebook() -> nbf.NotebookNode:
             import zipfile
             from pathlib import Path
 
-            REPO_URL = "https://github.com/<you>/Gemma4_Developer-Agent-Competition_202611.git"  #@param {type:"string"}
+            REPO_URL = "https://github.com/off4321/Gemma4_Developer-Agent-Competition_202611.git"  #@param {type:"string"}
             KAGGLE_API_TOKEN = ""  #@param {type:"string"}
             KAGGLE_USERNAME = ""  #@param {type:"string"}
             KAGGLE_KEY = ""  #@param {type:"string"}
@@ -173,9 +173,9 @@ def build_notebook() -> nbf.NotebookNode:
             KAGGLE_SECRETS = ("KAGGLE_API_TOKEN", "KAGGLE_API_KEY")
 
             if not (REPO_DIR / ".git").exists():
-                !git clone {REPO_URL} {REPO_DIR}
+                !git clone "{REPO_URL}" "{REPO_DIR}"
             else:
-                !git -C {REPO_DIR} pull --ff-only
+                !git -C "{REPO_DIR}" pull --ff-only
 
             %cd {REPO_DIR}
 
