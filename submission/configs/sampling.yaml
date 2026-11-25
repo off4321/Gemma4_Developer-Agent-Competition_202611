@@ -1,11 +1,10 @@
 # Generation config for the root coder agent (`gemma-4-e4b-it-qat-w4a16-ct` base).
 # CRITICAL: NEVER set `frequency_penalty` or `presence_penalty` > 0 on Gemma 4 tool calls!
-# vLLM applies frequency_penalty across `thought` + `<|tool_call>`, penalising Gemma 4's
-# `<|"|>` string-quote token and `_` underscores — which corrupts filenames (`\_`) and causes
-# Gemma4ToolParser to drop `old_string` / `new_string` ("mandatory input parameters not present").
+# `max_output_tokens: 6144` with `thinking_budget: 1536` gives 4,608 tokens for `<|tool_call>`
+# while keeping 26,624 tokens of input headroom within 32,768.
 temperature: 0.2
 top_p: 0.95
-max_output_tokens: 8192
+max_output_tokens: 6144
 thinking_config:
   thinking_budget: 1536
   include_thoughts: true
