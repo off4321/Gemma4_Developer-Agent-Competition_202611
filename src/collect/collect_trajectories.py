@@ -147,8 +147,13 @@ def parse_diff(patch: str) -> list[dict[str, Any]]:
     for line in patch.splitlines():
         if line.startswith(SECTION_STARTS):
             match = re.search(r" b/(\S+)", line) if line.startswith("diff --git ") else None
+            if line.startswith("--- ") and cur is not None and not cur["hunks"] and line[4:].strip() == "/dev/null":
+                cur["is_new"] = True
+                continue
             cur = {"path": match.group(1) if match else None,
-                   "hunks": [], "is_new": False, "is_delete": False}
+                   "hunks": [],
+                   "is_new": (line.startswith("--- ") and line[4:].strip() == "/dev/null"),
+                   "is_delete": False}
             files.append(cur)
         elif line.startswith("+++ "):
             target = line[4:].strip()
@@ -160,9 +165,12 @@ def parse_diff(patch: str) -> list[dict[str, Any]]:
         elif cur is not None:
             if line.startswith("@@"):
                 header = HUNK_HEADER_RE.match(line)
+                old_start = int(header.group(1)) if header else 1
+                if old_start == 0:
+                    cur["is_new"] = True
                 cur["hunks"].append({
                     "body": [],
-                    "old_start": int(header.group(1)) if header else 1,
+                    "old_start": old_start,
                     "new_start": int(header.group(2)) if header else 0,
                 })
             elif cur["hunks"] and line[:1] in {" ", "+", "-", ""}:
@@ -222,18 +230,19 @@ def protected_file(path: str) -> bool:
 
 
 def pytest_targets(test_patch: str, limit: int = 3) -> list[str]:
-    """Derive `path::test_name` targets from the graded test patch (order kept, duplicates dropped)."""
+    """Derive EXISTING test file paths from `test_patch` (never newly-added `+ def test_*` functions).
+
+    In Phase 1 (Container A), `task.test_patch` has NOT been applied yet:
+      - Functions matching `+ def test_...` do NOT exist in Container A and always fail with pytest exit 4.
+      - Brand-new test files (`old_start == 0` / `--- /dev/null`) also do NOT exist in Container A.
+    Returning only pre-existing test file paths guarantees valid Phase 1 pytest commands.
+    """
     targets: list[str] = []
-    cur_path = None
-    for line in test_patch.splitlines():
-        if line.startswith("+++ "):
-            cur_path = line[6:].strip() if line.startswith("+++ b/") else line[4:].strip()
-        elif cur_path and (match := TEST_FUNC_RE.match(line)):
-            targets.append(f"{cur_path}::{match.group(1)}")
-    if not targets:
-        # test 名が読めない差分は、触られる test file 自体を target にする
-        targets = [line[6:].strip() for line in test_patch.splitlines()
-                   if line.startswith("+++ b/") and line[6:].endswith(".py")]
+    for section in parse_diff(test_patch):
+        path = section.get("path") or ""
+        if section.get("is_new") or not path.endswith(".py"):
+            continue
+        targets.append(path)
     return list(dict.fromkeys(targets))[:limit]
 
 
@@ -320,7 +329,7 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
         return build_verifier_trajectory(task, system_prompt, budget, native_tools,
                                          max_edits, max_hunk_lines)
     sections = parse_diff(task.get("patch") or "")
-    sections = [s for s in sections if not protected_file(s["path"])]
+    sections = [s for s in sections if not protected_file(s["path"]) and not s.get("is_new")]
     if not sections:
         return None
     edits: list[dict[str, Any]] = []
@@ -329,6 +338,7 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
     if not edits or len(edits) > max_edits:
         return None
 
+    import shlex
     targets = pytest_targets(task.get("test_patch") or "")
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -338,25 +348,39 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
 
     call_index = 0
     files_changed = {e["filepath"] for e in edits}
-    # eval trace は 10 task 0 resolved で、その内訳が「見ていない行を old_string に書いて edit_file が
-    # 一致しない」巡りだった = edit_file する前に target 範囲を読む、という挙動そのものが未学習だった。
-    # 1 ファイル 1 read では不十分で、old_string を読んでいない時に限って read を追加する。
+
+    # Turn 1: De-oracle localization with `grep -rn` so the model learns to discover file:line first
+    # rather than hallucinating unseen line ranges on Turn 1.
+    first_edit = edits[0]
+    first_fp = first_edit["filepath"]
+    first_start = int(first_edit.get("start_line") or 1)
+    first_lines = [ln.strip() for ln in str(first_edit.get("old_string") or "").splitlines() if ln.strip()]
+    sym_candidates = hunk_symbols([f" {ln}" for ln in first_lines])
+    needle = (sym_candidates[0] if sym_candidates else Path(first_fp).stem)
+    grep_cmd = f"grep -rn --exclude-dir=docs --exclude-dir='.*' {shlex.quote(needle)} {_grep_target(first_fp)} | head -n 30"
+    grep_hit = f"{first_fp}:{first_start}:{first_lines[0][:80] if first_lines else needle}"
+    call_index += 1
+    append_call(
+        messages, call_index,
+        f"Locate {needle} in the package source (excluding docs/) to confirm exact file path and line numbers.",
+        {"name": "run_command", "arguments": {"command": grep_cmd}},
+        {"status": "ok", "stdout": grep_hit + "\n", "stderr": "", "exit_code": 0},
+        native_tools,
+    )
+
     read_contents: dict[str, list[str]] = {}
     n_reads = 0
     for i, edit in enumerate(edits):
         filepath = edit["filepath"]
-        # 各 edit_file の直前に、その old_string をそのまま含んだ read_file を置く。1 ファイル 1 read
-        # だと 2 発目の hunk を未読のまま edit するので、「この old_string を読んだか」で判定して
-        # 足りなければ追加で読む（write_file の新規 file は読む対象が無いので read なし）。
         if (edit["kind"] == "edit_file"
                 and not read_covers(read_contents, filepath, edit["old_string"])):
             n_reads += 1
             start_line = int(edit.get("start_line") or 1)
             end_line = max(int(edit.get("end_line") or start_line), start_line)
-            thought = (f"Read the block the issue points at in {filepath}:{start_line}-{end_line}. "
-                       "edit_file only matches text I have actually seen."
+            thought = (f"Read {filepath}:{start_line}-{end_line} (start_line <= end_line) found by grep "
+                       "so edit_file copies exact verbatim lines."
                        if not i else
-                       f"Read {filepath}:{start_line}-{end_line} before editing it there.")
+                       f"Read {filepath}:{start_line}-{end_line} before editing the next block.")
             observation = read_observation(filepath, start_line, end_line, edit["old_string"],
                                           include=edit["old_string"])
             read_contents.setdefault(filepath, []).append(str(observation["content"]))
@@ -367,10 +391,9 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
                         observation,
                         native_tools)
         if i:
-            thought = f"Apply the remaining change in {filepath}."
+            thought = f"Apply the remaining verbatim change in {filepath}."
         else:
-            thought = ("Locate the defect from the issue text. The change belongs in "
-                       f"{filepath}. Apply the minimal patch there, then run the targeted test.")
+            thought = f"Copy the exact seen lines from {filepath} and apply the minimal fix."
         call_index += 1
         if edit["kind"] == "write_file":
             append_call(messages, call_index, thought,
@@ -389,26 +412,24 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
                          "is_truncated": False},
                         native_tools)
 
-    test_cmd = (f"python3 -m pytest {' '.join(targets)} -q --tb=short"
-                if targets else "python3 -m pytest -q --tb=short -k changed")
-    call_index += 1
-    append_call(messages, call_index,
-                "Verify with the single test that covers this behaviour, "
-                "in /tmp-safe form (no new test files).",
-                {"name": "run_command", "arguments": {"command": test_cmd}},
-                {"status": "ok", "stdout": "all tests finished without failures",
-                 "stderr": "", "exit_code": 0},
-                native_tools)
+    py_files = [shlex.quote(f) for f in sorted(files_changed) if f.endswith(".py")]
+    compile_part = f"python3 -m py_compile {' '.join(py_files)} && " if py_files else ""
+    if targets:
+        test_cmd = f"{compile_part}python3 -m pytest {' '.join(shlex.quote(t) for t in targets)} -q --tb=short"
+        test_out = "passed in 0.38s"
+    else:
+        test_cmd = f"{compile_part}git diff --check && git diff --stat"
+        test_out = f" {len(files_changed)} file(s) changed\n"
 
     call_index += 1
     append_call(messages, call_index,
-                "Fix verified. No scratch files were left in /workspace, so submit now.",
-                {"name": "submit_patch", "arguments": {}},
-                {"status": "ok", "patch_size": len(task.get("patch") or ""),
-                 "files_changed": len(files_changed)},
+                "Verify syntax and run the existing targeted test file once before handing off to submitter.",
+                {"name": "run_command", "arguments": {"command": test_cmd}},
+                {"status": "ok", "stdout": test_out, "stderr": "", "exit_code": 0},
                 native_tools)
+
     messages.append({"role": "assistant",
-                     "content": "Minimal fix applied and verified with the targeted tests; patch submitted."})
+                     "content": f"Implemented and verified minimal fix in {', '.join(sorted(files_changed))}; ready for diff audit and submit_patch."})
 
     return {
         "messages": messages,
@@ -417,26 +438,111 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
             "base_commit": task.get("base_commit"), "n_edits": len(edits),
             "n_reads": n_reads,
             "files_changed": sorted(files_changed), "pytest_targets": targets,
-            # files_read / files_written / test_targets / test_status は tool 呼び出しから導く
             **_io_summary(messages),
-            "test_status": "passed",  # gold 教材の observation は「targeted test が通った」設定
+            "test_status": "passed",
             "source": "gold_patch",
         },
     }
 
 
-def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str, Any],
-                              native_tools: bool, max_edits: int, max_hunk_lines: int) -> dict[str, Any] | None:
-    """1-step error-recovery SFT trajectory (`FileEditError` -> `extract_block.py` -> exact `edit_file` -> `swe-guard` verify).
-
-    Happy-path-only SFT leaves the model out-of-distribution the first time `edit_file` returns
-    `old_string not found`, causing repeated blind retries. This teaches the exact recovery loop:
-    use `extract_block.py` to get the verbatim unique block, apply `edit_file`, verify with
-    `run_pytest_compact.py` + `check_patch.py`, and call `submit_patch`.
-    """
+def build_new_file_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str, Any],
+                              native_tools: bool, max_new_lines: int = 240) -> dict[str, Any] | None:
+    """SFT trajectory for tasks that introduce a new source file via `write_file` (e.g. fastapi_15661)."""
     import shlex
 
     sections = [s for s in parse_diff(task.get("patch") or "") if not protected_file(s["path"])]
+    new_sections = [s for s in sections if s.get("is_new")]
+    if not new_sections or len(sections) > 2:
+        return None
+    edits: list[dict[str, Any]] = []
+    for section in sections:
+        if section.get("is_new"):
+            lines = [ln[1:] for h in section["hunks"] for ln in h["body"] if ln.startswith("+")]
+            if not lines or len(lines) > max_new_lines:
+                return None
+            edits.append({"kind": "write_file", "filepath": section["path"], "content": "\n".join(lines) + "\n"})
+        else:
+            file_edits = edits_for_file(section, DEFAULT_MAX_HUNK_LINES)
+            if not file_edits:
+                return None
+            edits.extend(file_edits)
+
+    first_new = new_sections[0]["path"]
+    parent_dir = _grep_target(first_new)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": initial_user_prompt(
+            task.get("problem_statement") or task.get("hints_text") or "", task["repo"], budget)},
+    ]
+    call_index = 1
+    append_call(
+        messages, call_index,
+        f"Inspect directory {parent_dir} to see existing module conventions before creating {first_new}.",
+        {"name": "run_command", "arguments": {"command": f"ls -la {shlex.quote(parent_dir)} | head -n 30"}},
+        {"status": "ok", "stdout": f"total 16\ndrwxr-xr-x 2 root root 4096 .\n", "stderr": "", "exit_code": 0},
+        native_tools,
+    )
+    files_changed = set()
+    for edit in edits:
+        filepath = edit["filepath"]
+        files_changed.add(filepath)
+        if edit["kind"] == "write_file":
+            call_index += 1
+            append_call(
+                messages, call_index,
+                f"Create {filepath} with write_file matching all specification details.",
+                {"name": "write_file", "arguments": {"filepath": filepath, "content": edit["content"]}},
+                {"status": "ok", "filepath": filepath, "size": len(edit["content"])},
+                native_tools,
+            )
+        else:
+            start_line = int(edit.get("start_line") or 1)
+            end_line = max(int(edit.get("end_line") or start_line), start_line)
+            obs = read_observation(filepath, start_line, end_line, edit["old_string"], include=edit["old_string"])
+            call_index += 1
+            append_call(messages, call_index, f"Read {filepath}:{start_line}-{end_line} before editing.",
+                        {"name": "read_file", "arguments": {"filepath": filepath, "start_line": start_line, "end_line": end_line}},
+                        obs, native_tools)
+            call_index += 1
+            append_call(messages, call_index, f"Apply accompanying edit in {filepath}.",
+                        {"name": "edit_file", "arguments": {"filepath": filepath, "old_string": edit["old_string"], "new_string": edit["new_string"]}},
+                        {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact", "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                        native_tools)
+
+    py_files = [shlex.quote(f) for f in sorted(files_changed) if f.endswith(".py")]
+    verify_cmd = (f"python3 -m py_compile {' '.join(py_files)} && git diff --check && git diff --stat"
+                  if py_files else "git diff --check && git diff --stat")
+    call_index += 1
+    append_call(
+        messages, call_index,
+        "Verify syntax and git diff hygiene once before handing off to submitter.",
+        {"name": "run_command", "arguments": {"command": verify_cmd}},
+        {"status": "ok", "stdout": f" {len(files_changed)} file(s) changed\n", "stderr": "", "exit_code": 0},
+        native_tools,
+    )
+    messages.append({"role": "assistant", "content": f"Created and verified {', '.join(sorted(files_changed))}; ready for submission."})
+    return {
+        "messages": messages,
+        "meta": {
+            "instance_id": f"{task['instance_id']}__newfile",
+            "repo": task["repo"],
+            "base_commit": task.get("base_commit"),
+            "n_edits": len(edits),
+            "files_changed": sorted(files_changed),
+            **_io_summary(messages),
+            "test_status": "passed",
+            "source": "gold_new_file",
+        },
+    }
+
+
+def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str, Any],
+                              native_tools: bool, max_edits: int, max_hunk_lines: int,
+                              variant: int = 0) -> dict[str, Any] | None:
+    """Multi-mode error-recovery SFT trajectory (`variant` 0=FileEditError, 1=read_file ValueError, 2=pytest CommandError)."""
+    import shlex
+
+    sections = [s for s in parse_diff(task.get("patch") or "") if not protected_file(s["path"]) and not s.get("is_new")]
     if not sections:
         return None
     edits: list[dict[str, Any]] = []
@@ -476,49 +582,94 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
 
         if not recovered_first:
             recovered_first = True
-            # 1) Initial read_file near the region, followed by a slightly mis-indented edit_file that fails
-            bad_old = "\n".join(line.lstrip(" ") if idx == 0 else line
-                                for idx, line in enumerate(old_str.splitlines()))
-            if bad_old == old_str:
-                bad_old = old_str.rstrip() + "\n    # stale context"
-            obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
-            read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
-            call_index += 1
-            append_call(messages, call_index,
-                        f"Read {filepath}:{start_line}-{end_line} to inspect the target logic.",
-                        {"name": "read_file", "arguments": {
-                            "filepath": filepath, "start_line": start_line, "end_line": end_line}},
-                        obs_read, native_tools)
+            if variant == 1:
+                # Mode 1: Reversed read_file line range (`ValueError`) -> immediately fix to valid range (never repeat!)
+                bad_start, bad_end = end_line + 6, max(1, start_line - 1)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Inspect {filepath} around line {start_line}.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": bad_start, "end_line": bad_end}},
+                            {"status": "error", "error_type": "ValueError",
+                             "error_message": f"start_line ({bad_start}) cannot be greater than end_line ({bad_end})"},
+                            native_tools)
+                obs_read = read_observation(filepath, 1, max(120, end_line + 5), old_str, include=old_str)
+                read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
+                call_index += 1
+                append_call(messages, call_index,
+                            f"start_line exceeded end_line; never repeat a failed read_file call. Read {filepath} from line 1 to {max(120, end_line + 5)} instead.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": 1, "end_line": max(120, end_line + 5)}},
+                            obs_read, native_tools)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Copy exact verbatim lines from {filepath} and apply the minimal fix.",
+                            {"name": "edit_file", "arguments": {
+                                "filepath": filepath, "old_string": old_str, "new_string": new_str}},
+                            {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
+                             "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                            native_tools)
+            elif variant == 2:
+                # Mode 2: Normal read + edit_file, followed by a failing pytest filter -> switch check, never loop!
+                obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
+                read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Read {filepath}:{start_line}-{end_line} before editing.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": start_line, "end_line": end_line}},
+                            obs_read, native_tools)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Apply the minimal fix in {filepath}.",
+                            {"name": "edit_file", "arguments": {
+                                "filepath": filepath, "old_string": old_str, "new_string": new_str}},
+                            {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
+                             "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                            native_tools)
+            else:
+                # Mode 0 (default): FileEditError (`old_string not found`) -> re-read exact range -> verbatim edit_file
+                bad_old = "\n".join(line.lstrip(" ") if idx == 0 else line
+                                    for idx, line in enumerate(old_str.splitlines()))
+                if bad_old == old_str:
+                    bad_old = old_str.rstrip() + "\n    # stale context"
+                obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
+                read_contents.setdefault(filepath, []).append(str(obs_read["content"]))
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Read {filepath}:{start_line}-{end_line} to inspect the target logic.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": start_line, "end_line": end_line}},
+                            obs_read, native_tools)
 
-            call_index += 1
-            append_call(messages, call_index,
-                        f"Attempt minimal fix in {filepath}.",
-                        {"name": "edit_file", "arguments": {
-                            "filepath": filepath, "old_string": bad_old, "new_string": new_str}},
-                        {"status": "error", "error_type": "FileEditError",
-                         "error_message": "Failed to replace: old_string not found. Ensure your old_string matches the exact file content including indentation."},
-                        native_tools)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Attempt minimal fix in {filepath}.",
+                            {"name": "edit_file", "arguments": {
+                                "filepath": filepath, "old_string": bad_old, "new_string": new_str}},
+                            {"status": "error", "error_type": "FileEditError",
+                             "error_message": "Failed to replace: old_string not found. Ensure your old_string matches the exact file content including indentation."},
+                            native_tools)
 
-            # 2) Recovery via read_file on exact range -> verbatim block -> exact edit_file succeeds
-            re_start = max(1, start_line - 3)
-            re_end = end_line + 3
-            obs_reread = read_observation(filepath, re_start, re_end, old_str, include=old_str)
-            call_index += 1
-            append_call(messages, call_index,
-                        f"old_string did not match exact indentation in {filepath}. Re-read lines {re_start}-{re_end} with read_file and copy the verbatim block.",
-                        {"name": "read_file", "arguments": {
-                            "filepath": filepath, "start_line": re_start, "end_line": re_end}},
-                        obs_reread,
-                        native_tools)
+                re_start = max(1, start_line - 3)
+                re_end = end_line + 3
+                obs_reread = read_observation(filepath, re_start, re_end, old_str, include=old_str)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"old_string did not match exact indentation in {filepath}. Re-read lines {re_start}-{re_end} with read_file and copy the verbatim block.",
+                            {"name": "read_file", "arguments": {
+                                "filepath": filepath, "start_line": re_start, "end_line": re_end}},
+                            obs_reread,
+                            native_tools)
 
-            call_index += 1
-            append_call(messages, call_index,
-                        f"Copy the exact verbatim block from read_file into edit_file for {filepath}.",
-                        {"name": "edit_file", "arguments": {
-                            "filepath": filepath, "old_string": old_str, "new_string": new_str}},
-                        {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
-                         "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
-                        native_tools)
+                call_index += 1
+                append_call(messages, call_index,
+                            f"Copy the exact verbatim block from read_file into edit_file for {filepath}.",
+                            {"name": "edit_file", "arguments": {
+                                "filepath": filepath, "old_string": old_str, "new_string": new_str}},
+                            {"status": "ok", "filepath": filepath, "occurrences": 1, "strategy": "exact",
+                             "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
+                            native_tools)
         else:
             if not read_covers(read_contents, filepath, old_str):
                 obs_read = read_observation(filepath, start_line, end_line, old_str, include=old_str)
@@ -538,14 +689,25 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
                          "diff": f"--- a/{filepath}\n+++ b/{filepath}\n", "is_truncated": False},
                         native_tools)
 
-    compact_cmd = (f"pytest {shlex.quote(targets[0])} -q --tb=short"
-                   if targets else "python3 -c \"print('sanity ok')\"")
-    call_index += 1
-    append_call(messages, call_index,
-                "Run only the targeted test file without executing the full test suite.",
-                {"name": "run_command", "arguments": {"command": compact_cmd}},
-                {"status": "ok", "stdout": "1 passed in 0.42s", "stderr": "", "exit_code": 0},
-                native_tools)
+    if variant == 2:
+        bad_pytest = f"pytest {shlex.quote(targets[0])}::test_nonexistent_new_case -q" if targets else "pytest tests/test_missing.py -q"
+        call_index += 1
+        append_call(messages, call_index,
+                    "Try running a specific test case.",
+                    {"name": "run_command", "arguments": {"command": bad_pytest}},
+                    {"status": "error", "error_type": "CommandError",
+                     "error_message": "Command exited with status 4",
+                     "details": {"stdout": "", "stderr": "ERROR: not found", "exit_code": 4}},
+                    native_tools)
+    else:
+        compact_cmd = (f"pytest {shlex.quote(targets[0])} -q --tb=short"
+                       if targets else "python3 -c \"print('sanity ok')\"")
+        call_index += 1
+        append_call(messages, call_index,
+                    "Run only the existing targeted test file once without executing the full test suite.",
+                    {"name": "run_command", "arguments": {"command": compact_cmd}},
+                    {"status": "ok", "stdout": "1 passed in 0.42s", "stderr": "", "exit_code": 0},
+                    native_tools)
 
     py_files = [shlex.quote(f) for f in sorted(files_changed) if f.endswith(".py")]
     hygiene_cmd = (
@@ -554,21 +716,16 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
     )
     call_index += 1
     append_call(messages, call_index,
-                "Verify Python syntax, whitespace hygiene, and non-empty diff before submitting.",
+                "Never repeat a failing pytest filter; verify Python syntax, whitespace hygiene, and non-empty diff, then hand off to submitter."
+                if variant == 2 else
+                "Verify Python syntax, whitespace hygiene, and non-empty diff before handing off to submitter.",
                 {"name": "run_command", "arguments": {"command": hygiene_cmd}},
                 {"status": "ok", "stdout": f" {len(files_changed)} file(s) changed\n",
                  "stderr": "", "exit_code": 0},
                 native_tools)
 
-    call_index += 1
-    append_call(messages, call_index,
-                "Patch verified and READY_FOR_SUBMIT; call submit_patch.",
-                {"name": "submit_patch", "arguments": {}},
-                {"status": "ok", "patch_size": len(task.get("patch") or ""),
-                 "files_changed": len(files_changed)},
-                native_tools)
     messages.append({"role": "assistant",
-                     "content": "Recovered exact edit block, verified targeted tests and patch hygiene, and submitted."})
+                     "content": f"Recovered cleanly and verified {', '.join(sorted(files_changed))}; ready for final diff audit and submit_patch."})
 
     return {
         "messages": messages,
@@ -731,24 +888,27 @@ def build_analyzer_trajectory(task: dict[str, Any], system_prompt: str, budget: 
     # 不自然な形になると、実運用で存在しない行を探しに行く癖が出る）。
     needle = symbol or (first["old_string"].splitlines() or [""])[-1].strip().strip(":") \
         or Path(first["path"]).stem
-    call_index += 1
-    append_call(messages, call_index,
-                "Start where the prompt says to start: grep the reported behaviour, no reading yet.",
-                {"name": "run_command", "arguments": {
-                    "command": f'grep -rn "{needle}" {_grep_target(first["path"])} | head -40'}},
-                {"status": "ok", "exit_code": 0,
-                 "stdout": "\n".join(f"{h['path']}:{h['range'].split('-')[0]}: {needle}" for h in hunks[:5]),
-                 "stderr": ""},
-                native_tools)
+    # Half of analyzer trajectories teach graceful fallback when pre-computed code graphs are absent
+    if sum(ord(ch) for ch in str(task.get("instance_id", ""))) % 2 == 1:
+        call_index += 1
+        append_call(messages, call_index,
+                    f"Try symbol lookup for {symbol} first; if unavailable, fall back immediately to grep.",
+                    {"name": "search_similar_code", "arguments": {"query": symbol}},
+                    {"status": "error", "error_type": "SimilaritySearchError",
+                     "error_message": f"Repository {task['repo']} not found in local files at data/graphs"},
+                    native_tools)
+        grep_thought = "Graph index is unavailable; do NOT retry search_similar_code. Use grep excluding docs/ instead."
+    else:
+        grep_thought = "Search package source with grep (excluding docs/) using a concrete symbol identifier."
 
     call_index += 1
     append_call(messages, call_index,
-                "Confirm the owning symbol through the graph before reading the file.",
-                {"name": "search_similar_code", "arguments": {
-                    "query": f"{symbol} implementation in {first['path']}"}},
-                {"status": "ok", "matches": [
-                    {"node": f"{Path(h['path']).stem}.{s}" if (s := (h["symbols"] or [None])[0]) else h["path"],
-                     "path": h["path"]} for h in hunks[:3]]},
+                grep_thought,
+                {"name": "run_command", "arguments": {
+                    "command": f'grep -rn --exclude-dir=docs --exclude-dir=".*" "{needle}" {_grep_target(first["path"])} | head -40'}},
+                {"status": "ok", "exit_code": 0,
+                 "stdout": "\n".join(f"{h['path']}:{h['range'].split('-')[0]}: {needle}" for h in hunks[:5]),
+                 "stderr": ""},
                 native_tools)
 
     for h in hunks[:2]:
@@ -1442,9 +1602,10 @@ def main() -> int:
     parser.add_argument("--max-time-minutes", type=float, default=DEFAULT_MAX_TIME_MINUTES)
     parser.add_argument("--no-patch-examples", type=int, default=0,
                         help="role=main のとき NO_PATCH で終わる合成教材の件数（公式ハーネスは全タスク変更必須のため既定 0 で無効）")
-    parser.add_argument("--recovery-examples", type=int, default=24,
-                        help="role=main のとき、FileEditError -> extract_block.py -> edit_file 成功 "
-                             "-> swe-guard 検証の回復教材をこの件数だけ足す（0 で無効）")
+    parser.add_argument("--recovery-examples", type=int, default=30,
+                        help="role=main のとき、3種のエラー回復教材（FileEditError / ValueError / CommandError）を追加")
+    parser.add_argument("--new-file-examples", type=int, default=16,
+                        help="role=main のとき、新規ファイル作成（write_file）教材を追加")
     args = parser.parse_args()
 
     tasks_path = Path(args.tasks)
@@ -1463,10 +1624,12 @@ def main() -> int:
     task_cache: list[dict[str, Any]] = []
     stats = {"tasks": 0, "skipped_no_edits": 0, "skipped_too_many_edits": 0,
              "skipped_big_hunk": 0, "protected_only": 0, "skipped_no_usable_hunks": 0}
+    all_tasks: list[dict[str, Any]] = []
     for line in tasks_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         task = json.loads(line)
+        all_tasks.append(task)
         stats["tasks"] += 1
         traj = build_trajectory(task, system_prompt, budget, args.native_tools,
                                 args.max_edits, args.max_hunk_lines, role=args.role)
@@ -1475,6 +1638,17 @@ def main() -> int:
             continue
         records.append(traj)
         task_cache.append(task)
+
+    if args.role == "main" and args.new_file_examples > 0:
+        nf_added = 0
+        for task in all_tasks:
+            if nf_added >= args.new_file_examples:
+                break
+            cand = build_new_file_trajectory(task, system_prompt, budget, args.native_tools)
+            if cand:
+                records.append(cand)
+                nf_added += 1
+        print(f"[collect] New-file (write_file) 教材を {nf_added} 件追加")
 
     # 原因が repo の外の設定にある型の正解（NO_PATCH）を少量混ぜる。build_dpo_pairs 側で
     # NO_PATCH を失敗として教えないルールと対になっている。
@@ -1496,11 +1670,12 @@ def main() -> int:
             if rec_added >= args.recovery_examples:
                 break
             cand = build_recovery_trajectory(task, system_prompt, budget, args.native_tools,
-                                             args.max_edits, args.max_hunk_lines)
+                                             args.max_edits, args.max_hunk_lines,
+                                             variant=rec_added % 3)
             if cand:
                 records.append(cand)
                 rec_added += 1
-        print(f"[collect] Recovery 教材を {rec_added} 件追加（FileEditError -> extract_block.py -> edit_file）")
+        print(f"[collect] Recovery 教材を {rec_added} 件追加（3-mode: FileEditError / ValueError / CommandError）")
 
     if args.import_traces:
         traces_dir = Path(args.import_traces)

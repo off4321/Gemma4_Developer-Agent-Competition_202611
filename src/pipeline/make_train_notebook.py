@@ -322,15 +322,15 @@ def build_notebook() -> nbf.NotebookNode:
             BUILD_MODE = "main+analyzer"      #@param ["main", "main+analyzer", "all"]
             ADAPTER_NAME = "main_lora"        #@param {type:"string"}
             R = 16                            #@param {type:"integer"}
-            ALPHA = 32                        #@param {type:"integer"}
+            ALPHA = 16                        #@param {type:"integer"}
             USE_RSLORA = False                #@param {type:"boolean"}
-            LORA_PLUS_RATIO = 4.0             #@param {type:"number"}
+            LORA_PLUS_RATIO = 1.0             #@param {type:"number"}
             NEFTUNE_ALPHA = 5.0               #@param {type:"number"}
             USE_4BIT = False                  #@param {type:"boolean"}
-            LEARNING_RATE = "5e-5"            #@param {type:"string"}
+            LEARNING_RATE = "3e-5"            #@param {type:"string"}
             MAX_LEN = 10240                   #@param {type:"integer"}
             MAX_EXAMPLES = 200                #@param {type:"integer"}
-            SFT_EPOCHS = 2.0                  #@param {type:"number"}
+            SFT_EPOCHS = 1.0                  #@param {type:"number"}
             RUN_DPO = False                   #@param {type:"boolean"}
             DPO_EPOCHS = 1.0                  #@param {type:"number"}
             MAX_TOOL_CALLS = 45               #@param {type:"integer"}
@@ -456,11 +456,10 @@ def build_notebook() -> nbf.NotebookNode:
                 if not Path(data_file).is_file() or Path(data_file).stat().st_size == 0:
                     print(f"[stage1b] [skip] 教材が無い: {data_file}")
                     continue
-                role_flags = "--keep_prior_thoughts" if role != "main" else ""
                 cmd = (f"python3 src/train/train_lora.py --data {data_file} --out_dir {out_dir} "
                        f"--r {R} --alpha {ALPHA} --lr {LEARNING_RATE} --epochs {SFT_EPOCHS} "
-                       f"--neftune_alpha {NEFTUNE_ALPHA} "
-                       f"--max_len {MAX_LEN} --max_examples {MAX_EXAMPLES} {role_flags} {EXTRA_FLAGS}")
+                       f"--neftune_alpha {NEFTUNE_ALPHA} --log_every 2 "
+                       f"--max_len {MAX_LEN} --max_examples {MAX_EXAMPLES} --keep_prior_thoughts {EXTRA_FLAGS}")
                 print("[sft]", cmd, flush=True)
                 if run_stream(cmd) != 0:
                     print(f"[stage1b] train_lora failed for role={role}（cell 6 の DPO は main だけ試します）")

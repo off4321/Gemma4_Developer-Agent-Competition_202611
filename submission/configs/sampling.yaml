@@ -1,19 +1,12 @@
-# Generation constraints (HARNESS_README §2 / §2.2).
-# Allowed top-level fields ONLY (build_submission.py -> ALLOWED_GENERATION_FIELDS):
-#   temperature, top_p, top_k, max_output_tokens, presence_penalty, frequency_penalty,
-#   stop_sequences, response_mime_type, seed, thinking_config
-# -> `thinking_budget` / `include_thoughts` MUST live under `thinking_config`.
-#
-# `max_output_tokens` caps ONE assistant turn (thinking + tool_call combined on vLLM).
-# Because vLLM enforces `prompt_tokens + max_tokens <= 32768`, keeping `max_output_tokens` at
-# 5120 (instead of 8192) expands usable multi-turn input context from 24.5k to 27.6k tokens while
-# still leaving ~3840 tokens after `thinking_budget: 1280` for `< 60 line` `edit_file` payloads.
-temperature: 0.2
+# Generation config for Stage 2 (`coder_agent`).
+# `include_thoughts: true` retains prior turn reasoning so the 4B model remembers WHY a
+# previous `read_file`/`edit_file`/`pytest` call failed and never enters 0.5s blind loops.
+# `max_output_tokens: 4096` reserves 28,672 tokens of input context within 32,768.
+temperature: 0.4
 top_p: 0.95
-frequency_penalty: 0.1          # mild anti-repetition without penalising verbatim old_string indentation
-max_output_tokens: 5120
+frequency_penalty: 0.2
+presence_penalty: 0.1
+max_output_tokens: 4096
 thinking_config:
-  thinking_budget: 1280
-  include_thoughts: false       # HARNESS_README §2.4: thinking_budget > 0 enables reasoning on
-                                # every turn while stripping prior turns' `<|channel>thought` from history
-  # thinking_level: MEDIUM      # avoid: maps to OpenAI reasoning_effort and is dropped by litellm
+  thinking_budget: 1024
+  include_thoughts: true

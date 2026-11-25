@@ -73,25 +73,27 @@ def parse_args() -> argparse.Namespace:
 
     # LoRA shape
     p.add_argument("--r", type=int, default=16)
-    p.add_argument("--alpha", type=int, default=32)
+    p.add_argument("--alpha", type=int, default=16,
+                   help="16 (= r) keeps alpha/r=1.0 so LoRA guides format without crushing e4b's native reasoning")
     p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--target_modules", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     p.add_argument("--use_rslora", action="store_true", help="Rank-Stabilized LoRA (alpha / sqrt(r))")
     p.add_argument("--lora_plus_ratio", type=float, default=1.0,
-                   help="LoRA+ lr multiplier for lora_B params (e.g. 16.0; 1.0 = standard LoRA)")
+                   help="LoRA+ lr multiplier for lora_B params (1.0 = standard AdamW; high ratios cause 0.5s reflex loops)")
 
     # optimisation
     p.add_argument("--max_len", type=int, default=10240,
                    help="per-example token cap (10240 fits A100 40GB bf16; step-SFT middle-trims older turns)")
-    p.add_argument("--epochs", type=float, default=2.0)
+    p.add_argument("--epochs", type=float, default=1.0,
+                   help="1.0 epoch over ~1000 step-SFT examples (~120 updates) avoids memorising short-thought reflexes")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-    p.add_argument("--lr", type=float, default=5e-5,
-                   help="5e-5 default: 1e-4 on a 4-bit base with LoRA+ corrupted tool_call tokens on ~105 trajectories")
+    p.add_argument("--lr", type=float, default=3e-5,
+                   help="3e-5 gentle LR preserves base gemma-4-e4b-it multi-step error recovery")
     p.add_argument("--lr_scheduler", default="cosine", choices=["cosine", "linear"],
                    help="cosine (default) stabilises special tool_call tokens late in training")
-    p.add_argument("--warmup_steps", type=int, default=20)
-    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--warmup_steps", type=int, default=15)
+    p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--neftune_alpha", type=float, default=5.0,
                    help="NEFTune uniform embedding noise scale during train() (0 disables; zero inference cost)")
@@ -100,10 +102,12 @@ def parse_args() -> argparse.Namespace:
 
     # which tokens are supervised & train/inference context alignment
     p.add_argument("--step_sft", action="store_true", default=True,
-                   help="encode one example per assistant turn with middle-turn trimming (preserves submit_patch)")
+                   help="encode one example per assistant turn with middle-turn trimming")
     p.add_argument("--no_step_sft", dest="step_sft", action="store_false")
-    p.add_argument("--keep_prior_thoughts", action="store_true", default=False,
-                   help="keep prior assistant reasoning_content in history (enable for analyzer; False matches main include_thoughts=false)")
+    p.add_argument("--keep_prior_thoughts", action="store_true", default=True,
+                   help="keep prior assistant reasoning_content in history (matches sampling.yaml include_thoughts=true)")
+    p.add_argument("--strip_prior_thoughts", dest="keep_prior_thoughts", action="store_false",
+                   help="strip prior assistant reasoning_content (only use when sampling.yaml sets include_thoughts=false)")
     p.add_argument("--mask_system", action="store_true", default=True)
     p.add_argument("--train_on_system", dest="mask_system", action="store_false")
     p.add_argument("--train_on_observations", action="store_true",
@@ -116,7 +120,7 @@ def parse_args() -> argparse.Namespace:
                    help="auto: bfloat16 on Ampere+ (the 4x L4 scorer), float16 on Kaggle T4 x2")
     p.add_argument("--use_4bit", action="store_true", help="QLoRA (fit on a single 16 GB T4)")
     p.add_argument("--no_4bit", dest="use_4bit", action="store_false")
-    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--log_every", type=int, default=2)
     p.add_argument("--dry_run", action="store_true", help="load model + tokenize 1 example, save an empty adapter, exit")
     p.add_argument("--resume_from", default=None, help="existing adapter dir to continue from")
     return p.parse_args()

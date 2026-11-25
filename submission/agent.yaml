@@ -1,39 +1,18 @@
 # ============================================================================
-# Root agent config. MUST be at the ROOT of submission.zip.
-# Contract: HARNESS_README.md §2.2 / §3.2 (single declared model rule)
+# Root agent config (SequentialAgent 3-stage pipeline).
+# Contract: HARNESS_README.md §2.2 / §2.3 / §3.2 (single declared model rule)
+# Stage 1 (`code_analyzer_agent`) -> `localization_plan` (read-only explore)
+# Stage 2 (`coder_agent`)         -> `impl_report`       (edit/write + verify)
+# Stage 3 (`submitter_agent`)     -> `submit_patch()`    (audit diff + submit)
 # ============================================================================
-name: gemma_e4b_developer_agent
-model: gemma-4-e4b-it-qat-w4a16-ct          # must be one of ALLOWED_MODEL_NAMES
-adapter: main_lora                         # trained base = google/gemma-4-e4b-it (adapter_config.json)
-instruction: !include prompts/system.md
-tools:
-  # execution / lifecycle
-  - run_command
-  - get_status
-  - submit_patch
-  # workspace file tools
-  - read_file
-  - edit_file
-  - write_file
-  # code intelligence (graphs/*.json + embeddings/*.npz are pre-computed)
-  - get_code_neighbors
-  - search_similar_code
-  - get_code_subgraph
-  # read-only explorer wrapped as AgentTool: keeps exploration noise out of
-  # this agent's context window (HARNESS_README §10.4; model context = 128k, so cap ONE
-  # assistant turn via configs/sampling.yaml max_output_tokens instead of shrinking the context)
-  - agent_tool:
-      config_path: sub_agents/code_analyzer.yaml
-      skip_summarization: true
-  # keep commented out until adapters/verifier_lora/ exists: sub_agents/verifier.yaml is only
-  # reachable (and its model counted) once this entry is live -> HARNESS_README §2.3
-  # 2026-11-24: verifier を無効化（90-task run の実測）。`verifier` 呼び出しは 29 件で返ってきた
-  # のは `git status` 相当の stdout ばかり、さらに agent はそれを skill と混同して
-  # `run_skill_script(name="verifier")` -> SKILL_NOT_FOUND も落としている。検証は root の
-  # `run_command` + skills/swe-guard で行う（prompts/system.md §Working step 5）。
-  # - agent_tool:
-  #     config_path: sub_agents/verifier.yaml
-  #     skip_summarization: true
-skills:
-  - skills/swe-guard
-generate_content_config: !include configs/sampling.yaml
+agent_class: SequentialAgent
+name: gemma_e4b_developer_pipeline
+description: >-
+  Sequential SWE resolution pipeline separating read-only localization,
+  minimal patch implementation and verification, and final diff submission.
+sub_agents:
+  - config_path: sub_agents/code_analyzer.yaml
+  - config_path: sub_agents/coder.yaml
+  - config_path: sub_agents/submitter.yaml
+  # keep verifier commented out until adapters/verifier_lora/ exists
+  # - config_path: sub_agents/verifier.yaml

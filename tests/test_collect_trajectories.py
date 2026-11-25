@@ -118,7 +118,9 @@ TWO_HUNK_PATCH = """\
 TWO_HUNK_TEST_PATCH = """\
 --- a/tests/test_client.py
 +++ b/tests/test_client.py
-@@ -0,0 +1,2 @@
+@@ -10,2 +10,4 @@
+ def test_existing_client():
+     assert True
 +def test_timeout_ms():
 +    assert client.TIMEOUT_MS == 5000
 """
@@ -173,3 +175,49 @@ def test_recovery_trajectory_teaches_reread_and_native_hygiene() -> None:
     assert all("skills/swe-guard" not in cmd for cmd in run_cmds)
     assert any("pytest" in cmd for cmd in run_cmds)
     assert any("py_compile" in cmd and "git diff --stat" in cmd for cmd in run_cmds)
+
+
+def test_pytest_targets_excludes_newly_added_test_functions_and_new_test_files() -> None:
+    existing_file_patch = """\
+--- a/tests/test_sse.py
++++ b/tests/test_sse.py
+@@ -220,3 +220,8 @@
++def test_brand_new_hidden_case():
++    assert True
+"""
+    assert collect.pytest_targets(existing_file_patch) == ["tests/test_sse.py"]
+
+    brand_new_test_file = """\
+--- a/tests/test_prepare_release.py
++++ b/tests/test_prepare_release.py
+@@ -0,0 +1,10 @@
++def test_prepare():
++    assert True
+"""
+    assert collect.pytest_targets(brand_new_test_file) == []
+
+
+def test_deoracled_turn1_grep_and_three_recovery_variants() -> None:
+    rec = build_main(two_hunk_task())
+    assert rec is not None
+    steps = tool_steps(rec["messages"])
+    assert steps[0][0] == "run_command" and "grep -rn" in steps[0][1]["command"]
+
+    for variant in (0, 1, 2):
+        r = collect.build_recovery_trajectory(
+            two_hunk_task(), SYSTEM_PROMPT, BUDGET, True, 6, collect.DEFAULT_MAX_HUNK_LINES, variant=variant
+        )
+        assert r is not None
+
+    new_file_task = {
+        "instance_id": "synthetic:new-file",
+        "repo": "fastapi/fastapi",
+        "base_commit": "0" * 40,
+        "problem_statement": "Add scripts/prepare_release.py CLI.",
+        "patch": "--- a/scripts/prepare_release.py\n+++ b/scripts/prepare_release.py\n@@ -0,0 +1,3 @@\n+def main():\n+    return 0\n+\n",
+        "test_patch": "",
+    }
+    nf = collect.build_new_file_trajectory(new_file_task, SYSTEM_PROMPT, BUDGET, True)
+    assert nf is not None
+    nf_kinds = [s[0] for s in tool_steps(nf["messages"])]
+    assert "write_file" in nf_kinds
