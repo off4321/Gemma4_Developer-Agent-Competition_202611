@@ -46,14 +46,36 @@ def _compact_output(stdout: str, stderr: str) -> str:
     return "".join(head_lines) + marker + tail
 
 
+def _build_pythonpath(root: Path = Path("."), existing: str | None = None) -> str:
+    """Prepend src:. (if src/ exists) or . to PYTHONPATH for src-layout priority."""
+    prefixes = ["src", "."] if (root / "src").is_dir() else ["."]
+    if existing is None:
+        existing = os.environ.get("PYTHONPATH", "")
+    parts = prefixes + ([existing] if existing else [])
+    return os.pathsep.join(parts)
+
+
+def _is_zero_tests(returncode: int, stdout: str, stderr: str) -> bool:
+    """Return True when pytest collected 0 items, ran no tests, or exited with code 5."""
+    if returncode == 5:
+        return True
+    combined = f"{stdout}\n{stderr}".lower()
+    return "collected 0 items" in combined or "no tests ran" in combined
+
+
 def _selftest() -> int:
-    """Discovery must find nested real test files, and output must stay bounded."""
+    """Discovery must find nested real test files, PYTHONPATH/0-test checks work, and output stays bounded."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "tests" / "nest").mkdir(parents=True)
         (root / "tests" / "test_startup.py").write_text("def test_a():\n    assert True\n", encoding="utf-8")
         (root / "tests" / "nest" / "test_deep.py").write_text("def test_b():\n    assert True\n", encoding="utf-8")
         (root / "tests" / "notes.txt").write_text("not a test\n", encoding="utf-8")
+        assert _build_pythonpath(root, "") == "."
+        assert _build_pythonpath(root, "/opt/lib") == f".{os.pathsep}/opt/lib"
+        (root / "src").mkdir()
+        assert _build_pythonpath(root, "") == f"src{os.pathsep}."
+        assert _build_pythonpath(root, "/opt/lib") == f"src{os.pathsep}.{os.pathsep}/opt/lib"
         cwd = Path.cwd()
         os.chdir(root)
         try:
@@ -62,6 +84,10 @@ def _selftest() -> int:
             assert _discover_tests("notes") == [], "non-test files are not targets"
         finally:
             os.chdir(cwd)
+    assert _is_zero_tests(5, "", "")
+    assert _is_zero_tests(0, "collected 0 items\n", "")
+    assert _is_zero_tests(0, "", "no tests ran in 0.01s")
+    assert not _is_zero_tests(0, "1 passed in 0.05s", "")
     noisy = "\n".join(f"line {n} " + "x" * 80 for n in range(400))
     compacted = _compact_output(noisy, "")
     assert len(compacted) <= MAX_CHARS, len(compacted)
@@ -70,7 +96,7 @@ def _selftest() -> int:
     assert "line 200 " not in compacted, "the middle must be truncated"
     assert _compact_output("", "") == "(no output)"
     assert _compact_output("2 failed in 0.42s\n", "") == "2 failed in 0.42s"
-    print("SELFTEST_OK (nested discovery, non-test files ignored, output bounded, summary kept)")
+    print("SELFTEST_OK (nested discovery, pythonpath/0-test detection, output bounded, summary kept)")
     return 0
 
 
@@ -97,9 +123,11 @@ def main() -> int:
         print("TARGETS: " + " ".join(targets))
         return 0
 
-    cmd = [sys.executable, "-m", "pytest", *targets, "--tb=line", "-q"]
+    cmd = [sys.executable, "-m", "pytest", *targets, "--tb=line", "-q", "--maxfail=5"]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _build_pythonpath()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env)
     except subprocess.TimeoutExpired:
         print(f"TIMEOUT ({args.timeout}s): {' '.join(cmd)}")
         return 124
@@ -107,6 +135,9 @@ def main() -> int:
     print(f"CMD: {' '.join(cmd)}")
     print(f"EXIT: {proc.returncode}")
     print(_compact_output(proc.stdout, proc.stderr))
+    if _is_zero_tests(proc.returncode, proc.stdout, proc.stderr):
+        print("STATUS: BLOCKED (0 tests collected)")
+        return 5
     return proc.returncode
 
 

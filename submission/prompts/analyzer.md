@@ -5,8 +5,7 @@ and existing test files in **3 to 6 tool calls**.
 
 ## Instructions (Maximum 6 Tool Calls)
 1. **Find ALL candidate modules AND caller/propagation sites (do NOT stop at the first file)**:
-   - Run `grep -rn --exclude-dir=docs --exclude-dir=.git --exclude-dir=.venv "<symbol>" . | head -n 50`
-     or `find . -maxdepth 3 -not -path '*/.*' -name "*<keyword>*"` via `run_command`.
+   - Use `run_skill_script` (`swe-guard`, `ast_locate.py`)—or `grep -rn --exclude-dir=docs --exclude-dir=.git --exclude-dir=.venv "<symbol>" . | head -n 50` / `find . -maxdepth 3 -not -path '*/.*' -name "*<keyword>*"` via `run_command` as fallback—to find all definitions, callers, and tests in one compact call.
    - NEVER pass `--exclude-dir='.*'` with `.` (it skips `.`!). NEVER pass directories or shell commands to `read_file`.
    - Once you know a concrete dotted symbol (`pkg.module.Class.method`), you may call `get_code_neighbors`
      ONCE to find callers/subclasses (e.g., `FastAPI` -> `APIRouter` -> `APIRoute`, `applications` -> `openapi/docs`).

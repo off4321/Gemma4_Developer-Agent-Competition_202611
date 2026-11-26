@@ -1,27 +1,23 @@
 ---
 name: swe-guard
-description: edit_file-safe block reader, targeted pytest runner, and pre-submit patch hygiene / import check.
+description: AST locator, edit_file-safe block reader/editor, targeted pytest runner, pre-submit patch hygiene, and conventions resource.
 ---
 
 # swe-guard
 
-**IMPORTANT**: Skill reference scripts (`extract_block.py`, `run_pytest_compact.py`, `check_patch.py`,
-`safe_edit.py`) live inside the host skill bundle, **NOT** inside `/workspace`.
-**NEVER invoke `python3 skills/swe-guard/scripts/...` or `python3 scripts/...` via `run_command`**.
-Apply the equivalent workspace-native checks directly with `read_file`, `run_command`, and `verifier`:
+ADK's `run_skill_script` tool executes scripts from `swe-guard` directly inside the sandbox container
+(sharing `/workspace`), and `load_skill_resource` loads `resources/conventions.md`.
+**NEVER run `python3 skills/swe-guard/scripts/...` or `python3 scripts/...` via `run_command`** —
+invoke them ONLY via `run_skill_script` (NOT `run_command`).
 
-1. **Exact block inspection (`extract_block.py` discipline)** - before calling `edit_file`:
-   Read exact lines with `read_file(filepath, start_line, end_line)` (`1 <= start_line <= end_line`, <= 150 lines).
-   - `old_string not found`: copy 3-6 verbatim lines from `read_file` output (never anchor inside a docstring).
-   - `Target string occurs N times`: widen context to 5-8 surrounding code lines until unique.
-   - If `edit_file` fails twice on the same block (`safe_edit.py` discipline), run
-     `nl -ba <filepath> | sed -n 'X,Yp'` via `run_command` to see exact indentation; if corrupted, run `git checkout -- <filepath>`.
-2. **Targeted test execution (`run_pytest_compact.py` discipline)** - bounded pytest with `src/` priority:
-   Always prefix with `PYTHONPATH=src:.` and run `PYTHONPATH=src:. python3 -m pytest <single_test_file.py> -q --tb=short`
-   (never bare `pytest` or `pytest tests/`).
-3. **Pre-submit hygiene (`check_patch.py` discipline)** - mandatory before `submit_patch`:
-   Verify runtime import + non-empty clean diff via
-   `PYTHONPATH=src:. python3 -c "import <package>" && git diff --check && git diff --stat`, confirm `VERIFY_OK`,
-   and pass the `verifier` sub-agent audit (`VERDICT: GO`) before calling `submit_patch()`.
+## Skill Scripts (`run_skill_script`)
+1. `ast_locate.py` — AST symbol locator: finds definitions, callers, and matching tests across `/workspace` in one compact call.
+2. `extract_block.py` — Exact block reader: prints verbatim lines with indentation info and uniqueness check before `edit_file` (fallback: `read_file` with explicit `1 <= start_line <= end_line <= 150`).
+3. `safe_edit.py` — Fallback 1-indexed line-range editor (`--filepath`, `--start`, `--end`, `--replace-file` / `--stdin`) with protected-path guard and `ast.parse` rollback if `edit_file` fails twice.
+4. `run_pytest_compact.py` — Bounded targeted pytest runner (`--target` / `--query`, `src/` priority, output capped to keep 32k context clean).
+5. `check_patch.py` — Pre-submit hygiene & syntax check: verifies non-empty non-protected diff, no untracked/binary artifacts, and valid `ast.parse` syntax before `verifier` and `submit_patch()`.
+
+## Skill Resource (`load_skill_resource`)
+- `resources/conventions.md` — Repo conventions checklist (sibling exception messages, warning classes, and caller propagation).
 
 `code_analyzer_agent` and `verifier` are sub-agent tools (`agent_tool`), not skills.

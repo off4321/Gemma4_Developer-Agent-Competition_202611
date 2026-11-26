@@ -89,7 +89,7 @@ def test_generation_configs_are_legal_and_well_sized() -> None:
     assert verifier_cfg["thinking_config"]["include_thoughts"] is True
 
     root_cfg = load("configs/sampling.yaml")
-    assert root_cfg["max_output_tokens"] == 6144
+    assert root_cfg["max_output_tokens"] == 4096
     assert "frequency_penalty" not in root_cfg and "presence_penalty" not in root_cfg
     assert root_cfg["thinking_config"]["thinking_budget"] == 1536
     assert root_cfg["thinking_config"]["include_thoughts"] is True
@@ -106,5 +106,7 @@ def test_root_still_shares_only_the_skill_scripts() -> None:
     agent = load("agent.yaml")
     assert agent["skills"] == ["skills/swe-guard"]
     skill_doc = (SUBMISSION / "skills/swe-guard/SKILL.md").read_text(encoding="utf-8")
-    for script in ("extract_block.py", "run_pytest_compact.py", "check_patch.py"):
+    for script in ("ast_locate.py", "extract_block.py", "run_pytest_compact.py", "check_patch.py"):
         assert script in skill_doc, f"SKILL.md must document {script}"
+    assert (SUBMISSION / "skills/swe-guard/scripts/ast_locate.py").is_file()
+    assert (SUBMISSION / "skills/swe-guard/resources/conventions.md").is_file()
