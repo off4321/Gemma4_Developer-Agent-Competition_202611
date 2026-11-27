@@ -1078,11 +1078,12 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     print(f"[train] scheduler={sched_name}, warmup_steps={warmup}, total_steps={total_steps}, "
           f"batch_size={batch_size}, max_tokens_per_batch={max_tok_batch}, "
           f"batches/epoch={batches_per_epoch}, grad_accum={args.grad_accum}")
-    device = torch.device(next(model.parameters()).device)
+    backbone, lm_head, softcap = _get_backbone_and_lm_head(model)
+    device_src = backbone if backbone is not None else model
+    device = torch.device(next(device_src.parameters()).device)
     collator = Collator(tokenizer)
     neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
 
-    backbone, lm_head, softcap = _get_backbone_and_lm_head(model)
     liger_ce = _build_liger_ce(softcap) if (backbone is not None and lm_head is not None) else None
     fast_state: dict[str, Any] = {
         "backbone": backbone,
