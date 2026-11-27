@@ -631,9 +631,27 @@ def load_base(args: argparse.Namespace, model_path: str):
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     except Exception as exc:
         if "attn_implementation" in kwargs:
-            print(f"[model] attn_implementation={attn_impl!r} unsupported ({exc}); falling back to default")
+            print(f"[model] top-level attn_implementation={attn_impl!r} unsupported ({exc}); "
+                  f"loading default and patching text backbone to {attn_impl!r}")
             kwargs.pop("attn_implementation", None)
             model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+            # Gemma4AudioModel rejects top-level sdpa; apply sdpa specifically to text_config / language_model
+            patched = 0
+            text_cfg = getattr(model.config, "text_config", None)
+            if text_cfg is not None:
+                text_cfg._attn_implementation = attn_impl
+                patched += 1
+            text_lm = (
+                getattr(getattr(model, "model", None), "language_model", None)
+                or getattr(model, "language_model", None)
+            )
+            if text_lm is not None:
+                for mod in text_lm.modules():
+                    mcfg = getattr(mod, "config", None)
+                    if mcfg is not None and hasattr(mcfg, "_attn_implementation"):
+                        mcfg._attn_implementation = attn_impl
+                        patched += 1
+            print(f"[model] patched text backbone attention -> {attn_impl!r} ({patched} config refs)")
         else:
             raise
     if single_gpu and not args.use_4bit:
