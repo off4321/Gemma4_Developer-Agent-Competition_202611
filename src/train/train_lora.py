@@ -149,13 +149,23 @@ def load_examples(path: str, max_examples: int) -> list[Conversation]:
         raise SystemExit(f"[error] data file not found: {path} (run src/collect/collect_trajectories.py first)")
 
     conversations: list[Conversation] = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        messages = json.loads(line).get("messages") if line.strip() else None
-        if not messages:
-            continue
-        conversations.append(messages)
-        if max_examples and len(conversations) >= max_examples:
-            break
+    bad_lines = 0
+    with Path(path).open("r", encoding="utf-8", newline="\n") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                messages = json.loads(line).get("messages")
+            except json.JSONDecodeError:
+                bad_lines += 1
+                continue
+            if not messages:
+                continue
+            conversations.append(messages)
+            if max_examples and len(conversations) >= max_examples:
+                break
+    if bad_lines:
+        print(f"[warn] skipped {bad_lines} malformed JSONL line(s) in {path}")
 
     if not conversations:
         raise SystemExit(f"[error] no usable conversations in {path}")

@@ -396,6 +396,7 @@ def _map_foreign_call(raw_name: str, args: dict[str, Any]) -> tuple[str, dict[st
         command = str(args.get("command") or args.get("cmd") or "").strip()
         if not command:
             return None
+        command = command.replace("/testbed", "/workspace")
         return "run_command", {"command": command}
 
     if name in ("finish", "submit", "submit_patch"):
@@ -1356,9 +1357,9 @@ def _iter_hf_dataset(dataset_spec: str, default_split: str = "train") -> Iterabl
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
         for rec in records:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
 
 def run_import(args: argparse.Namespace) -> dict[str, int]:
@@ -1429,14 +1430,14 @@ def run_import(args: argparse.Namespace) -> dict[str, int]:
                     continue
 
                 if coder_fh is not None:
-                    coder_fh.write(json.dumps(build_coder_record(parsed, system_prompt), ensure_ascii=False) + "\n")
+                    coder_fh.write(json.dumps(build_coder_record(parsed, system_prompt), ensure_ascii=True) + "\n")
                 coder_count += 1
                 taken += 1
 
                 if locator_fh is not None and locator_count < args.max_examples:
                     loc = build_locator_record(parsed, analyzer_prompt)
                     if loc is not None:
-                        locator_fh.write(json.dumps(loc, ensure_ascii=False) + "\n")
+                        locator_fh.write(json.dumps(loc, ensure_ascii=True) + "\n")
                         locator_count += 1
 
                 if out_verifier and len(verifier_go) < verifier_cap:
