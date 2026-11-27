@@ -125,8 +125,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_ckpt", action="store_true", default=True,
                    help="enable non-reentrant gradient checkpointing (use --no_grad_ckpt on 80GB GPU for +25-35%% speed)")
     p.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
-    p.add_argument("--attn_implementation", default="sdpa",
-                   help="attention backend (sdpa / flash_attention_2 / eager)")
+    p.add_argument("--attn_implementation", default="flex_attention",
+                   help="attention backend for text backbone (flex_attention / sdpa / flash_attention_2 / eager)")
     p.add_argument("--log_every", type=int, default=2)
     p.add_argument("--save_every", type=int, default=200,
                    help="save intermediate checkpoint to out_dir every N optimizer steps (0 disables)")
@@ -609,11 +609,51 @@ def prepare_for_kbit_training(model, grad_ckpt: bool = True):
     return model
 
 
+def _apply_liger_gemma4_layers() -> None:
+    """Patch Gemma 4 RMSNorm & GeGLU layers with Liger Triton kernels (keeping our masked lm_head CE)."""
+    for fn_name in ("apply_liger_kernel_to_gemma4", "apply_liger_kernel_to_gemma4_text"):
+        try:
+            import liger_kernel.transformers as lkt
+            fn = getattr(lkt, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                fn(fused_linear_cross_entropy=False, cross_entropy=False)
+            except TypeError:
+                fn()
+            print(f"[model] applied Liger layer kernels via {fn_name}")
+            return
+        except Exception:
+            continue
+
+
+def _patch_text_attention(model, attn_impl: str) -> int:
+    """Set `_attn_implementation` on text_config and all text language_model submodules."""
+    patched = 0
+    text_cfg = getattr(model.config, "text_config", None)
+    if text_cfg is not None:
+        text_cfg._attn_implementation = attn_impl
+        patched += 1
+    text_lm = (
+        getattr(getattr(model, "model", None), "language_model", None)
+        or getattr(model, "language_model", None)
+    )
+    if text_lm is not None:
+        for mod in text_lm.modules():
+            mcfg = getattr(mod, "config", None)
+            if mcfg is not None and hasattr(mcfg, "_attn_implementation"):
+                mcfg._attn_implementation = attn_impl
+                patched += 1
+    return patched
+
+
 def load_base(args: argparse.Namespace, model_path: str):
-    """Load the base weights, enable SDPA / memory savers, and wrap `--resume_from` if provided."""
+    """Load the base weights, enable Liger / FlexAttention / memory savers, and wrap `--resume_from` if provided."""
+    if torch.cuda.is_available():
+        _apply_liger_gemma4_layers()
     kwargs: dict[str, Any] = {"trust_remote_code": True}
     single_gpu = torch.cuda.is_available() and torch.cuda.device_count() == 1
-    attn_impl = getattr(args, "attn_implementation", "sdpa")
+    attn_impl = getattr(args, "attn_implementation", "flex_attention")
     if attn_impl and torch.cuda.is_available():
         kwargs["attn_implementation"] = attn_impl
     if args.use_4bit and torch.cuda.is_available():
@@ -635,22 +675,7 @@ def load_base(args: argparse.Namespace, model_path: str):
                   f"loading default and patching text backbone to {attn_impl!r}")
             kwargs.pop("attn_implementation", None)
             model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-            # Gemma4AudioModel rejects top-level sdpa; apply sdpa specifically to text_config / language_model
-            patched = 0
-            text_cfg = getattr(model.config, "text_config", None)
-            if text_cfg is not None:
-                text_cfg._attn_implementation = attn_impl
-                patched += 1
-            text_lm = (
-                getattr(getattr(model, "model", None), "language_model", None)
-                or getattr(model, "language_model", None)
-            )
-            if text_lm is not None:
-                for mod in text_lm.modules():
-                    mcfg = getattr(mod, "config", None)
-                    if mcfg is not None and hasattr(mcfg, "_attn_implementation"):
-                        mcfg._attn_implementation = attn_impl
-                        patched += 1
+            patched = _patch_text_attention(model, attn_impl)
             print(f"[model] patched text backbone attention -> {attn_impl!r} ({patched} config refs)")
         else:
             raise
@@ -908,10 +933,27 @@ def training_step(
                 else:
                     fast_state["use_masked_head"] = False
             except Exception as exc:
-                if not fast_state.get("fallback_logged"):
-                    print(f"[train] masked lm_head path unavailable ({exc}); falling back to full logits + chunked CE")
-                    fast_state["fallback_logged"] = True
-                fast_state["use_masked_head"] = False
+                if "flex_attention" in str(exc).lower() or getattr(args, "attn_implementation", "") == "flex_attention":
+                    if not fast_state.get("flex_fallback_done"):
+                        print(f"[train] flex_attention runtime fallback -> 'sdpa' ({exc})")
+                        base_m = model.get_base_model() if hasattr(model, "get_base_model") else model
+                        _patch_text_attention(base_m, "sdpa")
+                        fast_state["flex_fallback_done"] = True
+                        out = backbone(**batch, use_cache=False)
+                        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+                        if hidden.size(-1) == lm_head.weight.size(1):
+                            loss = masked_lm_head_loss(
+                                hidden,
+                                labels,
+                                lm_head,
+                                softcap=fast_state.get("softcap"),
+                                liger_ce=fast_state.get("liger_ce"),
+                            )
+                if loss is None:
+                    if not fast_state.get("fallback_logged"):
+                        print(f"[train] masked lm_head path unavailable ({exc}); falling back to full logits + chunked CE")
+                        fast_state["fallback_logged"] = True
+                    fast_state["use_masked_head"] = False
         if loss is None:
             logits = model(**batch).logits
             loss = chunked_causal_lm_loss(logits, labels)
