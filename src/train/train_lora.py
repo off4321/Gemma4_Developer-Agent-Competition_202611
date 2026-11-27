@@ -128,6 +128,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_ckpt", action="store_true", default=True,
                    help="enable non-reentrant gradient checkpointing (use --no_grad_ckpt on 80GB GPU for +25-35%% speed)")
     p.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
+    p.add_argument("--grad_ckpt_skip_sliding", type=int, default=0,
+                   help="disable gradient checkpointing on N sliding-window layers (keeps full-attn checkpointed) to trade spare VRAM for speed")
     p.add_argument("--attn_implementation", default="sdpa",
                    help="attention backend for text backbone (sdpa / flex_attention / flash_attention_2 / eager)")
     p.add_argument("--log_every", type=int, default=2)
@@ -152,8 +154,8 @@ def resolve_model_path(explicit: str | None) -> str:
 
 
 # -------------------------------------------------------------------------------------- data
-def load_examples(path: str, max_examples: int) -> list[Conversation]:
-    """Read the JSONL, keeping one message list per line and stopping at the example cap."""
+def load_examples(path: str, max_examples: int, seed: int = 13) -> list[Conversation]:
+    """Read the JSONL, keeping one message list per line; shuffle before capping so multi-source files stay balanced."""
     if not Path(path).is_file():
         raise SystemExit(f"[error] data file not found: {path} (run src/collect/collect_trajectories.py first)")
 
@@ -171,10 +173,14 @@ def load_examples(path: str, max_examples: int) -> list[Conversation]:
             if not messages:
                 continue
             conversations.append(messages)
-            if max_examples and len(conversations) >= max_examples:
-                break
     if bad_lines:
         print(f"[warn] skipped {bad_lines} malformed JSONL line(s) in {path}")
+    if max_examples and len(conversations) > max_examples:
+        total_loaded = len(conversations)
+        rng = random.Random(seed)
+        rng.shuffle(conversations)
+        conversations = conversations[:max_examples]
+        print(f"[data] sampled {max_examples}/{total_loaded} conversations (seed={seed}) from {path}")
 
     if not conversations:
         raise SystemExit(f"[error] no usable conversations in {path}")
@@ -586,7 +592,10 @@ class Collator:
             rows["input_ids"].append(feature["input_ids"] + [self.pad_id] * pad)
             rows["labels"].append(feature["labels"] + [IGNORE] * pad)
             rows["attention_mask"].append(feature["attention_mask"] + [0] * pad)
-        return {key: torch.tensor(values, dtype=torch.long) for key, values in rows.items()}
+        tensors = {key: torch.tensor(values, dtype=torch.long) for key, values in rows.items()}
+        if torch.cuda.is_available():
+            tensors = {key: val.pin_memory() for key, val in tensors.items()}
+        return tensors
 
 
 # --------------------------------------------------------------------------------- base model
@@ -606,6 +615,38 @@ def _enable_grad_ckpt(model) -> None:
     except TypeError:
         model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
+
+
+def _apply_selective_grad_ckpt(model, skip_sliding: int) -> int:
+    """Disable gradient checkpointing on `skip_sliding` evenly-spaced sliding-window layers, keeping full-attn checkpointed."""
+    if skip_sliding <= 0:
+        return 0
+    sliding_layers = []
+    full_layers = 0
+    for mod in model.modules():
+        if not getattr(mod, "gradient_checkpointing", False):
+            continue
+        layer_type = getattr(mod, "layer_type", None)
+        is_sliding = (
+            layer_type == "sliding_attention"
+            or bool(getattr(getattr(mod, "self_attn", None), "is_sliding", False))
+        )
+        if is_sliding:
+            sliding_layers.append(mod)
+        elif layer_type is not None or hasattr(mod, "self_attn"):
+            full_layers += 1
+    if not sliding_layers:
+        return 0
+    n_disable = min(skip_sliding, len(sliding_layers))
+    step = len(sliding_layers) / n_disable
+    disabled = 0
+    for i in range(n_disable):
+        idx = int(i * step)
+        sliding_layers[idx].gradient_checkpointing = False
+        disabled += 1
+    print(f"[model] selective grad_ckpt: disabled checkpointing on {disabled}/{len(sliding_layers)} "
+          f"sliding-window layers (kept {full_layers} full-attn layers checkpointed)")
+    return disabled
 
 
 def prepare_for_kbit_training(model, grad_ckpt: bool = True):
@@ -744,6 +785,7 @@ def load_base(args: argparse.Namespace, model_path: str):
     else:
         if grad_ckpt:
             _enable_grad_ckpt(model)
+            _apply_selective_grad_ckpt(model, int(getattr(args, "grad_ckpt_skip_sliding", 0) or 0))
         model.config.use_cache = False
     if args.resume_from:
         model = PeftModel.from_pretrained(model, args.resume_from, is_trainable=True)
@@ -1128,6 +1170,7 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
                 rows, batch_size, max_tokens_per_batch=max_tok_batch, pad_to_multiple_of=pad_mult, max_len=args.max_len
             )
             optimizer.zero_grad(set_to_none=True)
+            accum_count = 0
 
             for step, batch_indices in enumerate(batches):
                 examples = [rows[idx] for idx in batch_indices]
@@ -1139,14 +1182,22 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
                     continue
                 running_loss = running_loss + loss.float()
                 valid_microsteps += 1
+                accum_count += 1
                 is_last_batch = (step + 1) == len(batches)
-                if (step + 1) % args.grad_accum and not is_last_batch:
+                if accum_count < args.grad_accum and not is_last_batch:
                     continue
 
+                if accum_count < args.grad_accum and accum_count > 0:
+                    # Rescale final partial accumulation window so effective LR matches a full grad_accum step
+                    scale = args.grad_accum / accum_count
+                    for p in trainable:
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
                 torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 global_step += 1
                 save_every = int(getattr(args, "save_every", 0) or 0)
                 if save_every > 0 and global_step % save_every == 0:
@@ -1197,20 +1248,33 @@ def rewrite_adapter_config(args: argparse.Namespace) -> None:
 
 
 def save_adapter(model, args: argparse.Namespace) -> None:
-    """Write safetensors only and strip DPO artifacts (`ref/`, `_checkpoints/`)."""
+    """Write safetensors atomically via a staging directory so mid-save disconnects never corrupt checkpoints."""
     import shutil
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir.parent / f".{out_dir.name}.tmp_save"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     try:
-        model.save_pretrained(args.out_dir, safe_serialization=True, selected_adapters=["default"])
+        model.save_pretrained(str(tmp_dir), safe_serialization=True, selected_adapters=["default"])
     except TypeError:
-        model.save_pretrained(args.out_dir, safe_serialization=True)
+        model.save_pretrained(str(tmp_dir), safe_serialization=True)
     for leftover_dir in ("ref", "_checkpoints"):
-        shutil.rmtree(out_dir / leftover_dir, ignore_errors=True)
-    rewrite_adapter_config(args)
-    for junk in out_dir.glob("*.bin"):
+        shutil.rmtree(tmp_dir / leftover_dir, ignore_errors=True)
+    for junk in tmp_dir.glob("*.bin"):
         junk.unlink()
+    tmp_args = argparse.Namespace(**{**vars(args), "out_dir": str(tmp_dir)})
+    rewrite_adapter_config(tmp_args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for src_file in tmp_dir.iterdir():
+        dst_file = out_dir / src_file.name
+        if src_file.is_dir():
+            shutil.rmtree(dst_file, ignore_errors=True)
+            shutil.move(str(src_file), str(dst_file))
+        else:
+            os.replace(str(src_file), str(dst_file))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"[train] saved adapter -> {args.out_dir}")
     files = {name: str(size) for name, size in sorted(
         (p.name, p.stat().st_size) for p in out_dir.rglob("*") if p.is_file())}
@@ -1242,7 +1306,7 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"[train] chat template mentions tools: {'tool' in (tokenizer.chat_template or '').lower()}")
 
-    dataset = build_dataset(tokenizer, load_examples(args.data, args.max_examples), args)
+    dataset = build_dataset(tokenizer, load_examples(args.data, args.max_examples, seed=args.seed), args)
     model = load_base(args, model_path)
     if args.resume_from is None:
         model = get_peft_model(model, build_lora_config(args, model))

@@ -278,3 +278,43 @@ def test_make_length_bucketed_batches_preserves_all_indices() -> None:
     for b in dyn_batches:
         if len(b) > 1:
             assert max(len(rows[i]["input_ids"]) for i in b) * len(b) <= 300
+
+
+def test_apply_selective_grad_ckpt_only_disables_sliding_layers() -> None:
+    import torch
+
+    class _FakeLayer(torch.nn.Module):
+        def __init__(self, layer_type: str):
+            super().__init__()
+            self.layer_type = layer_type
+            self.gradient_checkpointing = True
+
+    class _FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList(
+                [_FakeLayer("full_attention" if i % 6 == 5 else "sliding_attention") for i in range(12)]
+            )
+
+    model = _FakeModel()
+    disabled = train_lora._apply_selective_grad_ckpt(model, skip_sliding=4)
+    assert disabled == 4
+    sliding_off = [m for m in model.layers if m.layer_type == "sliding_attention" and not m.gradient_checkpointing]
+    full_off = [m for m in model.layers if m.layer_type == "full_attention" and not m.gradient_checkpointing]
+    assert len(sliding_off) == 4
+    assert len(full_off) == 0
+
+
+def test_load_examples_shuffles_before_capping(tmp_path) -> None:
+    import json
+
+    p = tmp_path / "traj.jsonl"
+    lines = [
+        json.dumps({"messages": [{"role": "user", "content": f"src_{i // 10}_{i}"}]})
+        for i in range(30)
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sampled = train_lora.load_examples(str(p), max_examples=12, seed=42)
+    assert len(sampled) == 12
+    sources = {conv[0]["content"].split("_")[1] for conv in sampled}
+    assert len(sources) == 3  # draws from all 3 sources, not just prefix src_0
