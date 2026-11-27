@@ -394,10 +394,11 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
             )
         except Exception:
             full_text = ""
+        special_guards = ("<|turn>model\n", "<|tool_response>", "<tool_response|>", "<turn|>")
         safe_fast_path = (
             "<|turn>model\n" in full_text
             and not any(
-                "<|turn>model\n" in str(m.get("content") or "")
+                any(tok in str(m.get("content") or "") for tok in special_guards)
                 for m in norm
                 if m.get("role") != "assistant"
             )
@@ -420,27 +421,62 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
                 u_ids = tokenizer(unsupervised_seg, add_special_tokens=False)["input_ids"]
                 input_ids.extend(u_ids)
                 labels.extend([IGNORE] * len(u_ids))
-                body_start = start + len(marker)
+                cur = start + len(marker)
 
-                # Assistant span ends right after `<turn|>\n` (or `<turn|>`) OR right before `<|tool_response>`
-                next_turn_end = full_text.find("<turn|>", body_start)
-                next_tool_resp = full_text.find("<|tool_response>", body_start)
-                if next_tool_resp != -1 and (next_turn_end == -1 or next_tool_resp < next_turn_end):
-                    # Tool-call assistant turn: supervise up to `<tool_call|>` (exclude trailing whitespace + `<|tool_response>`)
-                    tc_end = full_text.rfind("<tool_call|>", body_start, next_tool_resp)
-                    body_end = (tc_end + len("<tool_call|>")) if tc_end != -1 else next_tool_resp
-                elif next_turn_end != -1:
-                    body_end = next_turn_end + len("<turn|>")
-                    if body_end < len(full_text) and full_text[body_end] == "\n":
-                        body_end += 1
+                # Inside a Gemma 4 model turn, multiple (thought + tool_call) -> (<|tool_response>...<tool_response|>)
+                # cycles occur before `<turn|>` WITHOUT another `<|turn>model\n` header!
+                turn_end = full_text.find("<turn|>", cur)
+                if turn_end != -1:
+                    model_end = turn_end + len("<turn|>")
+                    if model_end < len(full_text) and full_text[model_end] == "\n":
+                        model_end += 1
                 else:
-                    body_end = len(full_text)
+                    model_end = len(full_text)
 
-                sup_seg = full_text[body_start:body_end]
-                s_ids = tokenizer(sup_seg, add_special_tokens=False)["input_ids"]
-                input_ids.extend(s_ids)
-                labels.extend(s_ids)
-                pos = body_end
+                while cur < model_end:
+                    tr_start = full_text.find("<|tool_response>", cur, model_end)
+                    if tr_start == -1:
+                        # Remaining assistant generation up to `<turn|>\n` (or end of text)
+                        next_model_hdr = full_text.find(marker, cur, model_end)
+                        if next_model_hdr != -1:
+                            # Handle templates that emit `<|turn>model\n` after tool response
+                            pre = full_text[cur: next_model_hdr + len(marker)]
+                            p_ids = tokenizer(pre, add_special_tokens=False)["input_ids"]
+                            input_ids.extend(p_ids)
+                            labels.extend([IGNORE] * len(p_ids))
+                            cur = next_model_hdr + len(marker)
+                            continue
+                        sup_seg = full_text[cur:model_end]
+                        s_ids = tokenizer(sup_seg, add_special_tokens=False)["input_ids"]
+                        input_ids.extend(s_ids)
+                        labels.extend(s_ids)
+                        cur = model_end
+                        break
+
+                    # Supervise assistant thought + tool_call up to `<tool_call|>` (exclude trailing ws before `<|tool_response>`)
+                    tc_end = full_text.rfind("<tool_call|>", cur, tr_start)
+                    sup_end = (tc_end + len("<tool_call|>")) if tc_end != -1 else tr_start
+                    if sup_end > cur:
+                        sup_seg = full_text[cur:sup_end]
+                        s_ids = tokenizer(sup_seg, add_special_tokens=False)["input_ids"]
+                        input_ids.extend(s_ids)
+                        labels.extend(s_ids)
+
+                    # Mask everything from `sup_end` through `<tool_response|>` (plus optional trailing newline)
+                    tr_close = full_text.find("<tool_response|>", tr_start, model_end)
+                    if tr_close == -1:
+                        obs_end = model_end
+                    else:
+                        obs_end = tr_close + len("<tool_response|>")
+                        if obs_end < model_end and full_text[obs_end] == "\n":
+                            obs_end += 1
+                    obs_seg = full_text[sup_end:obs_end]
+                    o_ids = tokenizer(obs_seg, add_special_tokens=False)["input_ids"]
+                    input_ids.extend(o_ids)
+                    labels.extend([IGNORE] * len(o_ids))
+                    cur = obs_end
+
+                pos = model_end
 
             if bos_id is not None and input_ids and input_ids[0] != bos_id:
                 input_ids, labels = [bos_id] + input_ids, [IGNORE] + labels

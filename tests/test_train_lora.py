@@ -145,3 +145,91 @@ def test_encode_step_examples_and_conversation_exclude_tool_response_from_labels
     conv_sup = tok.decode([lbl for lbl in conv["labels"] if lbl != train_lora.IGNORE])
     assert "<|tool_response>" not in conv_sup
     assert conv_sup.endswith("<turn|>\n")
+
+
+class _RealGemma4MultiTurnTokenizer(_FakeGemma4Tokenizer):
+    """Mimics Gemma 4's actual template: multiple tool_call/tool_response cycles inside ONE <|turn>model block."""
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        add_generation_prompt: bool = False,
+        tokenize: bool = False,
+        **_kwargs: Any,
+    ) -> str:
+        assert tokenize is False
+        parts: list[str] = []
+        in_model_turn = False
+        for msg in messages:
+            role = msg.get("role")
+            if role in ("system", "user"):
+                if in_model_turn:
+                    parts.append("<turn|>\n")
+                    in_model_turn = False
+                parts.append(f"<|turn>{role}\n{msg.get('content', '')}<turn|>\n")
+            elif role == "assistant":
+                if not in_model_turn:
+                    parts.append("<|turn>model\n")
+                    in_model_turn = True
+                thought = msg.get("reasoning_content") or ""
+                thought_blk = f"<|channel>thought\n{thought}\n<channel|>" if thought else ""
+                calls = msg.get("tool_calls") or []
+                if calls:
+                    call_str = "".join(
+                        f"<|tool_call>call:{c['function']['name']}{{}}<tool_call|>" for c in calls
+                    )
+                    parts.append(f"{thought_blk}{call_str}")
+                else:
+                    parts.append(f"{thought_blk}{msg.get('content', '')}<turn|>\n")
+                    in_model_turn = False
+            elif role == "tool":
+                parts.append(f"<|tool_response>{msg.get('content', '')}<tool_response|>")
+        return "".join(parts)
+
+
+def test_encode_conversation_supervises_all_turns_inside_single_gemma4_model_turn() -> None:
+    tok = _RealGemma4MultiTurnTokenizer()
+    args = argparse.Namespace(
+        max_len=4096,
+        keep_prior_thoughts=True,
+        action_loss_weight=1.0,
+        mask_system=True,
+        train_on_observations=False,
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "fix bug"},
+        {
+            "role": "assistant",
+            "content": "turn 1 read",
+            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "SECRET_OBS_1"},
+        {
+            "role": "assistant",
+            "content": "turn 2 edit",
+            "tool_calls": [{"id": "c2", "function": {"name": "edit_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c2", "content": "SECRET_OBS_2"},
+        {
+            "role": "assistant",
+            "content": "turn 3 submit",
+            "tool_calls": [{"id": "c3", "function": {"name": "submit_patch", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c3", "content": "SECRET_OBS_3"},
+        {"role": "assistant", "content": "Fixed cleanly."},
+    ]
+    conv = train_lora.encode_conversation(tok, messages, args)
+    assert conv is not None
+    sup = tok.decode([lbl for lbl in conv["labels"] if lbl != train_lora.IGNORE])
+    # ALL 4 assistant turns MUST be supervised!
+    assert "turn 1 read" in sup and "call:read_file" in sup
+    assert "turn 2 edit" in sup and "call:edit_file" in sup
+    assert "turn 3 submit" in sup and "call:submit_patch" in sup
+    assert "Fixed cleanly.<turn|>\n" in sup
+    # ZERO tool observations or `<|tool_response>` delimiters may be supervised!
+    assert "SECRET_OBS_1" not in sup
+    assert "SECRET_OBS_2" not in sup
+    assert "SECRET_OBS_3" not in sup
+    assert "<|tool_response>" not in sup
+    assert "<tool_response|>" not in sup
