@@ -567,13 +567,19 @@ def build_dataset(tokenizer: AutoTokenizer, conversations: list[Conversation], a
 
 
 class Collator:
-    """Pad a batch to its own width: labels pad with IGNORE so padding never enters the loss."""
+    """Pad a batch to its width (optionally rounded to `pad_to_multiple_of` to avoid flex_attention recompiles)."""
 
-    def __init__(self, tokenizer: AutoTokenizer):
+    def __init__(self, tokenizer: AutoTokenizer, pad_to_multiple_of: int = 0, max_len: int = 0):
         self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        self.pad_to_multiple_of = max(0, int(pad_to_multiple_of or 0))
+        self.max_len = max(0, int(max_len or 0))
 
     def __call__(self, features: list[Example]) -> dict[str, torch.Tensor]:
         width = max(len(f["input_ids"]) for f in features)
+        if self.pad_to_multiple_of > 1:
+            width = ((width + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of) * self.pad_to_multiple_of
+            if self.max_len > 0:
+                width = min(width, self.max_len)
         rows = {"input_ids": [], "labels": [], "attention_mask": []}
         for feature in features:
             pad = width - len(feature["input_ids"])
@@ -959,8 +965,9 @@ def training_step(
     clean_batch = [{k: ex[k] for k in ("input_ids", "labels", "attention_mask")} for ex in examples]
     batch = {key: value.to(device, non_blocking=True) for key, value in collator(clean_batch).items()}
     labels = batch.pop("labels")
-    # Drop attention_mask on CPU check (no GPU->CPU sync) when all sequences in micro-batch have equal length
-    all_unpadded = len({len(ex["input_ids"]) for ex in examples}) == 1
+    # Drop attention_mask on CPU check (no GPU->CPU sync) when all sequences match the exact padded width
+    padded_width = batch["input_ids"].size(1)
+    all_unpadded = all(len(ex["input_ids"]) == padded_width for ex in examples)
     if all_unpadded:
         batch.pop("attention_mask", None)
     try:
@@ -1083,7 +1090,8 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     backbone, lm_head, softcap = _get_backbone_and_lm_head(model)
     device_src = backbone if backbone is not None else model
     device = torch.device(next(device_src.parameters()).device)
-    collator = Collator(tokenizer)
+    pad_mult = 2048 if getattr(args, "attn_implementation", "") == "flex_attention" else 0
+    collator = Collator(tokenizer, pad_to_multiple_of=pad_mult, max_len=args.max_len)
     neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
 
     liger_ce = _build_liger_ce(softcap) if (backbone is not None and lm_head is not None) else None
@@ -1101,6 +1109,8 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
     valid_microsteps = 0
     t_start = time.monotonic()
+    t_last = t_start
+    last_log_step = 0
     try:
         for epoch in range(math.ceil(args.epochs)):
             batches = _make_length_bucketed_batches(rows, batch_size, max_tokens_per_batch=max_tok_batch)
@@ -1130,13 +1140,16 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
                     avg = (running_loss / max(1, valid_microsteps)).item()
                     running_loss.zero_()
                     valid_microsteps = 0
-                    elapsed = time.monotonic() - t_start
-                    sec_per_step = elapsed / max(1, global_step)
-                    eta_min = sec_per_step * max(0, total_steps - global_step) / 60.0
+                    now = time.monotonic()
+                    window_steps = max(1, global_step - last_log_step)
+                    cur_s_per_step = (now - t_last) / window_steps
+                    t_last = now
+                    last_log_step = global_step
+                    eta_min = cur_s_per_step * max(0, total_steps - global_step) / 60.0
                     mem_gb = (torch.cuda.max_memory_allocated() / 1024**3) if torch.cuda.is_available() else 0.0
                     print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
                           f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
-                          f"{sec_per_step:.1f}s/step ETA {eta_min:.1f}m mem {mem_gb:.1f} GiB")
+                          f"{cur_s_per_step:.1f}s/step ETA {eta_min:.1f}m mem {mem_gb:.1f} GiB")
                 if global_step >= total_steps:
                     break
     except KeyboardInterrupt:
@@ -1195,6 +1208,10 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch._dynamo.config.cache_size_limit = 64
+        except Exception:
+            pass
     args = parse_args()
     torch.manual_seed(args.seed)
     random.seed(args.seed)
