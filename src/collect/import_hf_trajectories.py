@@ -488,7 +488,7 @@ def _parse_trajectory_steps(
 
     steps: list[dict[str, Any]] = []
     final_summary_raw = ""
-    has_empty_reasoning = False
+    non_empty_thoughts = 0
     assistant_turns = 0
     i = 0
 
@@ -529,9 +529,8 @@ def _parse_trajectory_steps(
             continue
 
         assistant_turns += 1
-        if not thought or not thought.strip():
-            has_empty_reasoning = True
-            break
+        if thought and thought.strip():
+            non_empty_thoughts += 1
 
         # Gather matching observations from subsequent tool / observation / user-observation turns
         obs_texts: list[str] = []
@@ -570,7 +569,7 @@ def _parse_trajectory_steps(
                         final_summary_raw = tail_text
             break
 
-    if has_empty_reasoning or not steps:
+    if non_empty_thoughts == 0 or not steps:
         return None
     if assistant_turns > max_turns:
         return None
@@ -1363,51 +1362,13 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def run_import(args: argparse.Namespace) -> dict[str, int]:
-    """Execute trajectory import, filtering, and role-specialized export."""
+    """Execute trajectory import, filtering, and role-specialized streaming export."""
+    import math
+
     system_prompt = _load_prompt(ct.ROLE_SYSTEM_PROMPTS["main"])
     analyzer_prompt = _load_prompt(ct.ROLE_SYSTEM_PROMPTS["analyzer"])
     verifier_prompt = _load_prompt(ct.ROLE_SYSTEM_PROMPTS["verifier"])
     excluded_repos = _parse_exclude_repos(args.exclude_repos)
-
-    coder_records: list[dict[str, Any]] = []
-    locator_records: list[dict[str, Any]] = []
-    verifier_go: list[dict[str, Any]] = []
-    verifier_block: list[dict[str, Any]] = []
-
-    raw_sources: list[Iterable[dict[str, Any]]] = []
-    for ds_name in args.hf_dataset or []:
-        raw_sources.append(_iter_hf_dataset(ds_name, default_split=args.hf_split))
-    for path_str in args.local_jsonl or []:
-        raw_sources.append(_iter_local_jsonl(Path(path_str)))
-
-    for source in raw_sources:
-        for row in source:
-            if len(coder_records) >= args.max_examples:
-                break
-            parsed = _parse_trajectory_steps(
-                row,
-                excluded_repos=excluded_repos,
-                max_turns=args.max_turns,
-                min_edits=args.min_edits,
-            )
-            if parsed is None:
-                continue
-
-            coder_records.append(build_coder_record(parsed, system_prompt))
-            if len(locator_records) < args.max_examples:
-                loc = build_locator_record(parsed, analyzer_prompt)
-                if loc is not None:
-                    locator_records.append(loc)
-            verifier_go.append(build_verifier_go_from_trajectory(parsed, verifier_prompt))
-
-    for res_dir in args.results_dirs or []:
-        go_local, blk_local = harvest_verifier_from_results_dir(
-            Path(res_dir), verifier_prompt, excluded_repos
-        )
-        verifier_go.extend(go_local)
-        verifier_block.extend(blk_local)
-
-    verifier_records = _balance_verifier_records(verifier_go, verifier_block, args.max_examples)
 
     out_coder = args.out_coder
     out_locator = args.out_locator
@@ -1417,17 +1378,95 @@ def run_import(args: argparse.Namespace) -> dict[str, int]:
         out_locator = str(REPO_ROOT / "data" / "trajectories_locator.jsonl")
         out_verifier = str(REPO_ROOT / "data" / "trajectories_verifier.jsonl")
 
+    coder_fh = None
+    locator_fh = None
     if out_coder:
-        _write_jsonl(Path(out_coder), coder_records[: args.max_examples])
+        p = Path(out_coder)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        coder_fh = p.open("w", encoding="utf-8")
     if out_locator:
-        _write_jsonl(Path(out_locator), locator_records[: args.max_examples])
+        p = Path(out_locator)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        locator_fh = p.open("w", encoding="utf-8")
+
+    coder_count = 0
+    locator_count = 0
+    verifier_go: list[dict[str, Any]] = []
+    verifier_block: list[dict[str, Any]] = []
+    verifier_cap = min(args.max_examples, 4000)
+
+    raw_sources: list[tuple[str, Iterable[dict[str, Any]]]] = []
+    for ds_name in args.hf_dataset or []:
+        raw_sources.append((ds_name, _iter_hf_dataset(ds_name, default_split=args.hf_split)))
+    for path_str in args.local_jsonl or []:
+        raw_sources.append((path_str, _iter_local_jsonl(Path(path_str))))
+
+    seen_rows = 0
+    dropped_rows = 0
+    per_source_counts: dict[str, int] = {}
+
+    try:
+        for src_idx, (src_label, source) in enumerate(raw_sources):
+            remaining_total = args.max_examples - coder_count
+            if remaining_total <= 0:
+                break
+            remaining_sources = len(raw_sources) - src_idx
+            # Fair per-source quota with automatic rollover if an earlier source yields fewer
+            source_quota = math.ceil(remaining_total / remaining_sources)
+            taken = 0
+            for row in source:
+                if taken >= source_quota or coder_count >= args.max_examples:
+                    break
+                seen_rows += 1
+                parsed = _parse_trajectory_steps(
+                    row,
+                    excluded_repos=excluded_repos,
+                    max_turns=args.max_turns,
+                    min_edits=args.min_edits,
+                )
+                if parsed is None:
+                    dropped_rows += 1
+                    continue
+
+                if coder_fh is not None:
+                    coder_fh.write(json.dumps(build_coder_record(parsed, system_prompt), ensure_ascii=False) + "\n")
+                coder_count += 1
+                taken += 1
+
+                if locator_fh is not None and locator_count < args.max_examples:
+                    loc = build_locator_record(parsed, analyzer_prompt)
+                    if loc is not None:
+                        locator_fh.write(json.dumps(loc, ensure_ascii=False) + "\n")
+                        locator_count += 1
+
+                if out_verifier and len(verifier_go) < verifier_cap:
+                    verifier_go.append(build_verifier_go_from_trajectory(parsed, verifier_prompt))
+            per_source_counts[src_label] = taken
+    finally:
+        if coder_fh is not None:
+            coder_fh.close()
+        if locator_fh is not None:
+            locator_fh.close()
+
+    for res_dir in args.results_dirs or []:
+        go_local, blk_local = harvest_verifier_from_results_dir(
+            Path(res_dir), verifier_prompt, excluded_repos
+        )
+        verifier_go.extend(go_local)
+        verifier_block.extend(blk_local)
+
+    verifier_records = _balance_verifier_records(verifier_go, verifier_block, verifier_cap)
     if out_verifier:
         _write_jsonl(Path(out_verifier), verifier_records[: args.max_examples])
 
+    print(
+        f"[import] seen={seen_rows} kept={coder_count} dropped={dropped_rows} "
+        f"per_source={per_source_counts} locator={locator_count} verifier={len(verifier_records)}"
+    )
     return {
-        "coder": len(coder_records[: args.max_examples]),
-        "locator": len(locator_records[: args.max_examples]),
-        "verifier": len(verifier_records[: args.max_examples]),
+        "coder": coder_count,
+        "locator": locator_count,
+        "verifier": len(verifier_records),
         "verifier_go": sum(1 for r in verifier_records if r["meta"]["verdict"] == "GO"),
         "verifier_block": sum(1 for r in verifier_records if r["meta"]["verdict"] == "BLOCK"),
     }

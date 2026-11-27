@@ -301,9 +301,15 @@ def test_filtering_resolved_reasoning_py_edits_and_exclude_repos(tmp_path: Path)
     bad_exit["exit_status"] = "max_step"
     excluded_repo = _openai_resolved_trajectory(instance_id="bad-3", repo="django/django", resolved=True)
 
-    # Empty assistant reasoning
+    # Empty assistant reasoning across all assistant turns -> rejected
     empty_thought = _openai_resolved_trajectory(instance_id="bad-4", resolved=True)
-    empty_thought["messages"][2]["content"] = "   "
+    for m in empty_thought["messages"]:
+        if m.get("role") == "assistant":
+            m["content"] = "   "
+
+    # Single turn without thought while other turns have reasoning -> kept (common in HF trajectories)
+    partial_thought = _openai_resolved_trajectory(instance_id="good-partial", resolved=True)
+    partial_thought["messages"][2]["content"] = "   "
 
     # Non-.py edit only
     md_only = _openai_resolved_trajectory(instance_id="bad-5", resolved=True)
@@ -316,7 +322,10 @@ def test_filtering_resolved_reasoning_py_edits_and_exclude_repos(tmp_path: Path)
 
     good = _openai_resolved_trajectory(instance_id="good-1", resolved=True)
 
-    lines = [json.dumps(r) for r in (unresolved, bad_exit, excluded_repo, empty_thought, md_only, good)]
+    lines = [
+        json.dumps(r)
+        for r in (unresolved, bad_exit, excluded_repo, empty_thought, partial_thought, md_only, good)
+    ]
     in_jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     rc = imp.main([
@@ -327,7 +336,7 @@ def test_filtering_resolved_reasoning_py_edits_and_exclude_repos(tmp_path: Path)
     assert rc == 0
 
     rows = _read_jsonl(out_coder)
-    assert [r["meta"]["instance_id"] for r in rows] == ["good-1"]
+    assert [r["meta"]["instance_id"] for r in rows] == ["good-partial", "good-1"]
 
 
 def test_locator_prefix_extraction_capped_at_6_calls(tmp_path: Path) -> None:

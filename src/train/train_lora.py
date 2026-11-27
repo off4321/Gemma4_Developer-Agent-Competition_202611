@@ -36,6 +36,7 @@ from typing import Any
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
+import torch.utils.checkpoint
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (
@@ -121,6 +122,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_4bit", action="store_true", help="QLoRA (fit on a single 16 GB T4)")
     p.add_argument("--no_4bit", dest="use_4bit", action="store_false")
     p.add_argument("--log_every", type=int, default=2)
+    p.add_argument("--save_every", type=int, default=200,
+                   help="save intermediate checkpoint to out_dir every N optimizer steps (0 disables)")
     p.add_argument("--dry_run", action="store_true", help="load model + tokenize 1 example, save an empty adapter, exit")
     p.add_argument("--resume_from", default=None, help="existing adapter dir to continue from")
     return p.parse_args()
@@ -364,26 +367,90 @@ def encode_step_examples(tokenizer: AutoTokenizer, messages: Conversation,
 
 def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
                         args: argparse.Namespace) -> Example | None:
-    """Tokenize a conversation turn by turn, labelling unsupervised tokens IGNORE.
+    """Tokenize a full conversation in O(T) using single-render Gemma 4 turn-span segmentation.
 
-    A turn is the token delta between the full renders of `norm[:i + 1]` and `norm[:i]`, so the
-    template keeps the multi-turn context it needs to serialise `tool_calls` (rendering each
-    message alone is what corrupted `main_lora`). Fall back to `render_message` per turn when a
-    template rejects a partial conversation.
-
-    Returns None when masking leaves nothing to learn, so the caller can drop the example.
+    Avoids O(T^2) prefix re-tokenisation and boundary drift from intermediate delimiter stripping.
+    Falls back to turn-by-turn delta tokenisation for non-Gemma templates.
     """
     norm = [_normalize_tool_calls(message) for message in messages]
-    input_ids: list[int] = []
-    labels: list[int] = []
     bos_id = tokenizer.bos_token_id
-    unstable = False
+    keep_prior = bool(getattr(args, "keep_prior_thoughts", True))
 
+    # Fast O(T) path for Gemma 4 `<|turn>model\n` templates (when observations are masked)
+    if not getattr(args, "train_on_observations", False):
+        try:
+            full_text = _strip_trailing_tool_response(
+                _render_conversation(tokenizer, norm, preserve_thinking=keep_prior, add_generation_prompt=False)
+            )
+        except Exception:
+            full_text = ""
+        safe_fast_path = (
+            "<|turn>model\n" in full_text
+            and not any(
+                "<|turn>model\n" in str(m.get("content") or "")
+                for m in norm
+                if m.get("role") != "assistant"
+            )
+        )
+        if safe_fast_path:
+            input_ids: list[int] = []
+            labels: list[int] = []
+            pos = 0
+            marker = "<|turn>model\n"
+            while pos < len(full_text):
+                start = full_text.find(marker, pos)
+                if start == -1:
+                    seg = full_text[pos:]
+                    ids = tokenizer(seg, add_special_tokens=False)["input_ids"]
+                    input_ids.extend(ids)
+                    labels.extend([IGNORE] * len(ids))
+                    break
+                # Everything up to and including `<|turn>model\n` is unsupervised
+                unsupervised_seg = full_text[pos: start + len(marker)]
+                u_ids = tokenizer(unsupervised_seg, add_special_tokens=False)["input_ids"]
+                input_ids.extend(u_ids)
+                labels.extend([IGNORE] * len(u_ids))
+                body_start = start + len(marker)
+
+                # Assistant span ends right after `<turn|>\n` (or `<turn|>`) OR right before `<|tool_response>`
+                next_turn_end = full_text.find("<turn|>", body_start)
+                next_tool_resp = full_text.find("<|tool_response>", body_start)
+                if next_tool_resp != -1 and (next_turn_end == -1 or next_tool_resp < next_turn_end):
+                    # Tool-call assistant turn: supervise up to `<tool_call|>` (exclude trailing whitespace + `<|tool_response>`)
+                    tc_end = full_text.rfind("<tool_call|>", body_start, next_tool_resp)
+                    body_end = (tc_end + len("<tool_call|>")) if tc_end != -1 else next_tool_resp
+                elif next_turn_end != -1:
+                    body_end = next_turn_end + len("<turn|>")
+                    if body_end < len(full_text) and full_text[body_end] == "\n":
+                        body_end += 1
+                else:
+                    body_end = len(full_text)
+
+                sup_seg = full_text[body_start:body_end]
+                s_ids = tokenizer(sup_seg, add_special_tokens=False)["input_ids"]
+                input_ids.extend(s_ids)
+                labels.extend(s_ids)
+                pos = body_end
+
+            if bos_id is not None and input_ids and input_ids[0] != bos_id:
+                input_ids, labels = [bos_id] + input_ids, [IGNORE] + labels
+            labels = labels[:args.max_len]
+            if not any(label != IGNORE for label in labels):
+                return None
+            return {"input_ids": input_ids[:args.max_len], "labels": labels,
+                    "attention_mask": [1] * min(len(input_ids), args.max_len)}
+
+    # Fallback for non-Gemma chat templates or train_on_observations=True
+    input_ids = []
+    labels = []
+    unstable = False
     for index, message in enumerate(norm):
         try:
-            rendered = _strip_trailing_tool_response(_render_conversation(tokenizer, norm[:index + 1]))
+            rendered = _render_conversation(tokenizer, norm[:index + 1], preserve_thinking=keep_prior)
+            if index == len(norm) - 1:
+                rendered = _strip_trailing_tool_response(rendered)
             prefix = tokenizer(rendered, add_special_tokens=False)["input_ids"]
-        except Exception as exc:  # a template that refuses a partial conversation
+        except Exception as exc:
             print(f"[warn] apply_chat_template(messages[:{index + 1}]) failed ({exc}); "
                   f"falling back to render_message for this turn")
             ids = tokenizer(
@@ -391,14 +458,12 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
                 add_special_tokens=False,
             )["input_ids"]
             if index and bos_id is not None and ids and ids[0] == bos_id:
-                ids = ids[1:]  # the template re-adds BOS every turn; keep only the leading one
+                ids = ids[1:]
         else:
-            # a template that re-renders from scratch (rather than appending a turn) would shift the
-            # labels, so say so once instead of silently mislabelling every turn after it
             if not unstable and prefix[:len(input_ids)] != input_ids:
                 unstable = True
                 print("[warn] chat template is not prefix-stable: labels may shift at turn edges")
-            ids = prefix[len(input_ids):]  # delta against the prefix already accumulated
+            ids = prefix[len(input_ids):]
         supervised = is_supervised(message.get("role"), args)
         input_ids.extend(ids)
         labels.extend(ids if supervised else [IGNORE] * len(ids))
@@ -408,7 +473,7 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
 
     labels = labels[:args.max_len]
     if not any(label != IGNORE for label in labels):
-        return None  # nothing left for the loss after truncation
+        return None
     return {"input_ids": input_ids[:args.max_len], "labels": labels,
             "attention_mask": [1] * min(len(input_ids), args.max_len)}
 
@@ -562,8 +627,17 @@ def build_optimizer(model, args: argparse.Namespace) -> torch.optim.AdamW:
 
 
 # ---------------------------------------------------------------------------------- training
+def _chunk_cross_entropy(sub_logits: torch.Tensor, sub_labels: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(
+        sub_logits.reshape(-1, sub_logits.size(-1)).float(),
+        sub_labels,
+        ignore_index=IGNORE,
+        reduction="sum",
+    )
+
+
 def chunked_causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
-    """Compute shifted cross-entropy in sequence chunks to avoid a 4+ GiB fp32 logits spike on 262k vocab."""
+    """Compute shifted cross-entropy in checkpointed chunks so fp32 casts never accumulate across the sequence."""
     shift_logits = logits[:, :-1, :]
     shift_labels = labels[:, 1:]
     valid_tokens = (shift_labels != IGNORE).sum()
@@ -576,10 +650,14 @@ def chunked_causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor, chunk_siz
         sub_labels = shift_labels[:, start:end].reshape(-1)
         if not (sub_labels != IGNORE).any():
             continue
-        sub_logits = shift_logits[:, start:end, :].reshape(-1, shift_logits.size(-1)).float()
-        total_loss = total_loss + torch.nn.functional.cross_entropy(
-            sub_logits, sub_labels, ignore_index=IGNORE, reduction="sum"
-        )
+        sub_logits = shift_logits[:, start:end, :]
+        if sub_logits.requires_grad:
+            chunk_loss = torch.utils.checkpoint.checkpoint(
+                _chunk_cross_entropy, sub_logits, sub_labels, use_reentrant=False
+            )
+        else:
+            chunk_loss = _chunk_cross_entropy(sub_logits, sub_labels)
+        total_loss = total_loss + chunk_loss
     return total_loss / valid_tokens
 
 
@@ -665,6 +743,10 @@ def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Name
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                save_every = int(getattr(args, "save_every", 0) or 0)
+                if save_every > 0 and global_step % save_every == 0:
+                    save_adapter(model, args)
+                    print(f"[train] intermediate checkpoint saved at step {global_step}/{total_steps}")
                 if global_step % args.log_every:
                     continue
                 avg = running_loss / (args.log_every * args.grad_accum)
@@ -672,6 +754,10 @@ def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Name
                 print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
                       f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
                       f"mem {torch.cuda.max_memory_allocated() / 1024**3:.1f} GiB")
+    except KeyboardInterrupt:
+        print(f"[train] interrupted at step {global_step}; saving latest adapter to {args.out_dir}")
+        save_adapter(model, args)
+        raise
     finally:
         if neftune_handle is not None:
             neftune_handle.remove()
