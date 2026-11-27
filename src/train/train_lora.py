@@ -267,6 +267,22 @@ def _step_loss_weight(message: Message, args: argparse.Namespace) -> float:
     return 1.0
 
 
+def _strip_trailing_tool_response(text: str) -> str:
+    """Strip Gemma 4's trailing `<|tool_response>` delimiter appended after `tool_calls`.
+
+    Even with `add_generation_prompt=False`, Gemma 4's chat template emits `<|tool_response>`
+    (sometimes with surrounding newlines) after an assistant turn that contains `tool_calls`.
+    Leaving it on `full_text` leaks `<|tool_response>` into supervised `comp_ids`, while normal
+    text turns ending with `<turn|>` must be preserved unchanged.
+    """
+    stripped = text.rstrip()
+    if stripped.endswith("<|tool_response>"):
+        return stripped[: -len("<|tool_response>")].rstrip()
+    if stripped.endswith("<tool_call|>"):
+        return stripped
+    return text
+
+
 def encode_step_examples(tokenizer: AutoTokenizer, messages: Conversation,
                          args: argparse.Namespace) -> list[dict[str, Any]]:
     """Encode one training example per assistant turn, matching vLLM/ADK inference context.
@@ -313,6 +329,7 @@ def encode_step_examples(tokenizer: AutoTokenizer, messages: Conversation,
                 prompt_text = "".join(render_message(tokenizer, m) for m in trimmed)
                 full_text = prompt_text + render_message(tokenizer, target_msg)
 
+            full_text = _strip_trailing_tool_response(full_text)
             prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
             full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
             if len(full_ids) <= args.max_len - 1 or len(trimmed) <= 2:
@@ -364,12 +381,15 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
 
     for index, message in enumerate(norm):
         try:
-            prefix = tokenizer(_render_conversation(tokenizer, norm[:index + 1]),
-                               add_special_tokens=False)["input_ids"]
+            rendered = _strip_trailing_tool_response(_render_conversation(tokenizer, norm[:index + 1]))
+            prefix = tokenizer(rendered, add_special_tokens=False)["input_ids"]
         except Exception as exc:  # a template that refuses a partial conversation
             print(f"[warn] apply_chat_template(messages[:{index + 1}]) failed ({exc}); "
                   f"falling back to render_message for this turn")
-            ids = tokenizer(render_message(tokenizer, message), add_special_tokens=False)["input_ids"]
+            ids = tokenizer(
+                _strip_trailing_tool_response(render_message(tokenizer, message)),
+                add_special_tokens=False,
+            )["input_ids"]
             if index and bos_id is not None and ids and ids[0] == bos_id:
                 ids = ids[1:]  # the template re-adds BOS every turn; keep only the leading one
         else:

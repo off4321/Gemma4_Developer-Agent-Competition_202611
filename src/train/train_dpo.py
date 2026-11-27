@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
 import math
 import os
@@ -235,6 +236,7 @@ def main() -> int:
         raise SystemExit("[error] `trl` is required for DPO (`pip install -q trl`)") from exc
 
     dpo_fields = {f.name for f in dataclasses.fields(DPOConfig)}
+    trainer_params = set(inspect.signature(DPOTrainer.__init__).parameters)
     total_steps = max(1, math.ceil(len(dataset) / max(1, args.batch_size * args.grad_accum) * args.epochs))
     dpo_kwargs: dict[str, Any] = {
         "output_dir": str(Path(args.out_dir) / "_checkpoints"),
@@ -270,17 +272,44 @@ def main() -> int:
         else:
             dpo_kwargs["loss_type"] = loss_types[0]
 
+    # Anchor KL to the Stage-1 SFT checkpoint rather than the pre-SFT base model.
+    # Use "default" as the trainable adapter (PyTorch nn.ModuleDict rejects "train",
+    # trl >= 1.0 requires "default" to auto-clone "ref", and save_adapter selects "default").
+    trainer_kwargs: dict[str, Any] = {}
+    if args.resume_from:
+        if "ref_adapter_name" in dpo_fields or "ref_adapter_name" in trainer_params:
+            if hasattr(model, "peft_config") and "ref" not in model.peft_config:
+                model.load_adapter(args.resume_from, adapter_name="ref", is_trainable=False)
+            if hasattr(model, "set_adapter"):
+                model.set_adapter("default")
+            if "model_adapter_name" in dpo_fields:
+                dpo_kwargs["model_adapter_name"] = "default"
+            elif "model_adapter_name" in trainer_params:
+                trainer_kwargs["model_adapter_name"] = "default"
+            if "ref_adapter_name" in dpo_fields:
+                dpo_kwargs["ref_adapter_name"] = "ref"
+            elif "ref_adapter_name" in trainer_params:
+                trainer_kwargs["ref_adapter_name"] = "ref"
+        elif hasattr(model, "set_adapter"):
+            model.set_adapter("default")
+
     dpo_args = DPOConfig(**{k: v for k, v in dpo_kwargs.items() if k in dpo_fields})
     optimizer = build_optimizer(model, args)
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,  # PEFT adapter-off reference saves VRAM
+        ref_model=None,  # PEFT adapter reference ("ref" when resumed, base when fresh) saves VRAM
         args=dpo_args,
         train_dataset=dataset,
         processing_class=tokenizer,
         optimizers=(optimizer, None),
+        **trainer_kwargs,
     )
     trainer.train()
+    if hasattr(model, "peft_config") and "ref" in model.peft_config:
+        if hasattr(model, "set_adapter"):
+            model.set_adapter("default")
+        if hasattr(model, "delete_adapter"):
+            model.delete_adapter("ref")
     save_adapter(model, args)
     return 0
 

@@ -221,3 +221,34 @@ def test_deoracled_turn1_grep_and_three_recovery_variants() -> None:
     assert nf is not None
     nf_kinds = [s[0] for s in tool_steps(nf["messages"])]
     assert "write_file" in nf_kinds
+
+
+def test_all_main_builders_call_submit_patch_before_final_summary() -> None:
+    new_file_task = {
+        "instance_id": "synthetic:new-file",
+        "repo": "fastapi/fastapi",
+        "base_commit": "0" * 40,
+        "problem_statement": "Add scripts/prepare_release.py CLI.",
+        "patch": "--- a/scripts/prepare_release.py\n+++ b/scripts/prepare_release.py\n@@ -0,0 +1,3 @@\n+def main():\n+    return 0\n+\n",
+        "test_patch": "",
+    }
+    records = [
+        build_main(two_hunk_task()),
+        collect.build_new_file_trajectory(new_file_task, SYSTEM_PROMPT, BUDGET, True),
+        collect.build_recovery_trajectory(
+            two_hunk_task(), SYSTEM_PROMPT, BUDGET, True, 6, collect.DEFAULT_MAX_HUNK_LINES
+        ),
+    ]
+    for rec in records:
+        assert rec is not None
+        msgs = rec["messages"]
+        assert msgs[-1]["role"] == "assistant" and not msgs[-1].get("tool_calls")
+        assert msgs[-2]["role"] == "tool"
+        submit_obs = json.loads(msgs[-2]["content"])
+        assert submit_obs["status"] == "ok"
+        assert submit_obs["files_changed"] == len(rec["meta"]["files_changed"])
+        assert submit_obs["patch_size"] > 0
+        submit_calls = msgs[-3]["tool_calls"]
+        assert len(submit_calls) == 1
+        assert submit_calls[0]["function"]["name"] == "submit_patch"
+        assert json.loads(submit_calls[0]["function"]["arguments"]) == {}

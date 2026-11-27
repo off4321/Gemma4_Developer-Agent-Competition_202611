@@ -274,6 +274,22 @@ def append_call(messages: list[dict[str, Any]], call_index: int, thought: str, c
     messages.append(tool_msg(call_index, observation))
 
 
+def _append_submit_patch(messages: list[dict[str, Any]], call_index: int, task: dict[str, Any],
+                         files_changed: set[str], native_tools: bool) -> int:
+    """Append the terminal `submit_patch()` tool call right before the final summary."""
+    call_index += 1
+    patch_size = max(1, len(task.get("patch") or ""))
+    append_call(
+        messages,
+        call_index,
+        "Verification checks pass with a clean minimal diff; call submit_patch to record the solution.",
+        {"name": "submit_patch", "arguments": {}},
+        {"status": "ok", "patch_size": patch_size, "files_changed": len(files_changed)},
+        native_tools,
+    )
+    return call_index
+
+
 def initial_user_prompt(problem_statement: str, repo: str, budget: dict[str, Any]) -> str:
     return (
         f"You are evaluating a software engineering task for repository {repo}.\n\n"
@@ -423,13 +439,14 @@ def build_trajectory(task: dict[str, Any], system_prompt: str, budget: dict[str,
 
     call_index += 1
     append_call(messages, call_index,
-                "Verify syntax and run the existing targeted test file once before handing off to submitter.",
+                "Verify syntax and run the existing targeted test file once before submitting.",
                 {"name": "run_command", "arguments": {"command": test_cmd}},
                 {"status": "ok", "stdout": test_out, "stderr": "", "exit_code": 0},
                 native_tools)
 
+    call_index = _append_submit_patch(messages, call_index, task, files_changed, native_tools)
     messages.append({"role": "assistant",
-                     "content": f"Implemented and verified minimal fix in {', '.join(sorted(files_changed))}; ready for diff audit and submit_patch."})
+                     "content": f"Implemented, verified, and submitted the minimal fix in {', '.join(sorted(files_changed))}."})
 
     return {
         "messages": messages,
@@ -515,12 +532,13 @@ def build_new_file_trajectory(task: dict[str, Any], system_prompt: str, budget: 
     call_index += 1
     append_call(
         messages, call_index,
-        "Verify syntax and git diff hygiene once before handing off to submitter.",
+        "Verify syntax and git diff hygiene once before submitting.",
         {"name": "run_command", "arguments": {"command": verify_cmd}},
         {"status": "ok", "stdout": f" {len(files_changed)} file(s) changed\n", "stderr": "", "exit_code": 0},
         native_tools,
     )
-    messages.append({"role": "assistant", "content": f"Created and verified {', '.join(sorted(files_changed))}; ready for submission."})
+    call_index = _append_submit_patch(messages, call_index, task, files_changed, native_tools)
+    messages.append({"role": "assistant", "content": f"Created, verified, and submitted {', '.join(sorted(files_changed))}."})
     return {
         "messages": messages,
         "meta": {
@@ -716,16 +734,17 @@ def build_recovery_trajectory(task: dict[str, Any], system_prompt: str, budget: 
     )
     call_index += 1
     append_call(messages, call_index,
-                "Never repeat a failing pytest filter; verify Python syntax, whitespace hygiene, and non-empty diff, then hand off to submitter."
+                "Never repeat a failing pytest filter; verify Python syntax, whitespace hygiene, and non-empty diff, then submit."
                 if variant == 2 else
-                "Verify Python syntax, whitespace hygiene, and non-empty diff before handing off to submitter.",
+                "Verify Python syntax, whitespace hygiene, and non-empty diff before submitting.",
                 {"name": "run_command", "arguments": {"command": hygiene_cmd}},
                 {"status": "ok", "stdout": f" {len(files_changed)} file(s) changed\n",
                  "stderr": "", "exit_code": 0},
                 native_tools)
 
+    call_index = _append_submit_patch(messages, call_index, task, files_changed, native_tools)
     messages.append({"role": "assistant",
-                     "content": f"Recovered cleanly and verified {', '.join(sorted(files_changed))}; ready for final diff audit and submit_patch."})
+                     "content": f"Recovered cleanly, verified, and submitted {', '.join(sorted(files_changed))}."})
 
     return {
         "messages": messages,
