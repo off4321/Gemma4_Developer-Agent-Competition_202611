@@ -128,8 +128,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_ckpt", action="store_true", default=True,
                    help="enable non-reentrant gradient checkpointing (use --no_grad_ckpt on 80GB GPU for +25-35%% speed)")
     p.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
-    p.add_argument("--attn_implementation", default="flex_attention",
-                   help="attention backend for text backbone (flex_attention / sdpa / flash_attention_2 / eager)")
+    p.add_argument("--attn_implementation", default="sdpa",
+                   help="attention backend for text backbone (sdpa / flex_attention / flash_attention_2 / eager)")
     p.add_argument("--log_every", type=int, default=2)
     p.add_argument("--save_every", type=int, default=200,
                    help="save intermediate checkpoint to out_dir every N optimizer steps (0 disables)")
@@ -970,10 +970,12 @@ def training_step(
     all_unpadded = all(len(ex["input_ids"]) == padded_width for ex in examples)
     if all_unpadded:
         batch.pop("attention_mask", None)
+    out = None
+    hidden = None
+    loss = None
     try:
         backbone = fast_state.get("backbone")
         lm_head = fast_state.get("lm_head")
-        loss = None
         if backbone is not None and lm_head is not None and fast_state.get("use_masked_head", True):
             try:
                 out = backbone(**batch, use_cache=False)
@@ -1017,8 +1019,8 @@ def training_step(
             loss = chunked_causal_lm_loss(logits, labels)
         (loss * avg_weight / args.grad_accum).backward()
     except torch.cuda.OutOfMemoryError:
+        del out, hidden, loss, batch, labels
         model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
         lens = [len(ex["input_ids"]) for ex in examples]
         print(f"[warn] OOM at micro-batch {step_idx} (lens={lens}), skipping")
         return None
@@ -1029,6 +1031,8 @@ def _make_length_bucketed_batches(
     rows: list[Example],
     batch_size: int,
     max_tokens_per_batch: int = 0,
+    pad_to_multiple_of: int = 0,
+    max_len: int = 0,
 ) -> list[list[int]]:
     """Group similarly-sized trajectories into fixed-size or dynamic token-budget batches."""
     indices = list(range(len(rows)))
@@ -1040,7 +1044,12 @@ def _make_length_bucketed_batches(
         for idx in indices:
             seq_len = len(rows[idx]["input_ids"])
             cand_max = max(cur_max_len, seq_len)
-            if cur and cand_max * (len(cur) + 1) > max_tokens_per_batch:
+            cand_padded = cand_max
+            if pad_to_multiple_of > 1:
+                cand_padded = ((cand_padded + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+                if max_len > 0:
+                    cand_padded = min(cand_padded, max_len)
+            if cur and cand_padded * (len(cur) + 1) > max_tokens_per_batch:
                 batches.append(cur)
                 cur = [idx]
                 cur_max_len = seq_len
@@ -1075,7 +1084,10 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     max_tok_batch = max(0, int(getattr(args, "max_tokens_per_batch", 0) or 0))
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = build_optimizer(model, args)
-    sample_batches = _make_length_bucketed_batches(rows, batch_size, max_tokens_per_batch=max_tok_batch)
+    pad_mult = 2048 if getattr(args, "attn_implementation", "") == "flex_attention" else 0
+    sample_batches = _make_length_bucketed_batches(
+        rows, batch_size, max_tokens_per_batch=max_tok_batch, pad_to_multiple_of=pad_mult, max_len=args.max_len
+    )
     batches_per_epoch = len(sample_batches)
     total_steps = max(1, int(math.ceil(batches_per_epoch / args.grad_accum) * args.epochs))
     warmup = min(args.warmup_steps, max(1, total_steps // 5))
@@ -1090,7 +1102,6 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     backbone, lm_head, softcap = _get_backbone_and_lm_head(model)
     device_src = backbone if backbone is not None else model
     device = torch.device(next(device_src.parameters()).device)
-    pad_mult = 2048 if getattr(args, "attn_implementation", "") == "flex_attention" else 0
     collator = Collator(tokenizer, pad_to_multiple_of=pad_mult, max_len=args.max_len)
     neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
 
@@ -1113,13 +1124,18 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     last_log_step = 0
     try:
         for epoch in range(math.ceil(args.epochs)):
-            batches = _make_length_bucketed_batches(rows, batch_size, max_tokens_per_batch=max_tok_batch)
+            batches = _make_length_bucketed_batches(
+                rows, batch_size, max_tokens_per_batch=max_tok_batch, pad_to_multiple_of=pad_mult, max_len=args.max_len
+            )
             optimizer.zero_grad(set_to_none=True)
 
             for step, batch_indices in enumerate(batches):
                 examples = [rows[idx] for idx in batch_indices]
                 loss = training_step(model, examples, step, device, collator, args, fast_state)
                 if loss is None:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
                 running_loss = running_loss + loss.float()
                 valid_microsteps += 1
