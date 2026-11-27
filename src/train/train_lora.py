@@ -981,6 +981,8 @@ def training_step(
                     )
                 else:
                     fast_state["use_masked_head"] = False
+            except torch.cuda.OutOfMemoryError:
+                raise
             except Exception as exc:
                 if "flex_attention" in str(exc).lower() or getattr(args, "attn_implementation", "") == "flex_attention":
                     if not fast_state.get("flex_fallback_done"):
