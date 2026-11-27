@@ -398,9 +398,8 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
         safe_fast_path = (
             "<|turn>model\n" in full_text
             and not any(
-                any(tok in str(m.get("content") or "") for tok in special_guards)
+                any(tok in json.dumps(m, ensure_ascii=False) for tok in special_guards)
                 for m in norm
-                if m.get("role") != "assistant"
             )
         )
         if safe_fast_path:
@@ -426,10 +425,13 @@ def encode_conversation(tokenizer: AutoTokenizer, messages: Conversation,
                 # Inside a Gemma 4 model turn, multiple (thought + tool_call) -> (<|tool_response>...<tool_response|>)
                 # cycles occur before `<turn|>` WITHOUT another `<|turn>model\n` header!
                 turn_end = full_text.find("<turn|>", cur)
-                if turn_end != -1:
+                next_any_turn = full_text.find("<|turn>", cur)
+                if turn_end != -1 and (next_any_turn == -1 or turn_end < next_any_turn):
                     model_end = turn_end + len("<turn|>")
                     if model_end < len(full_text) and full_text[model_end] == "\n":
                         model_end += 1
+                elif next_any_turn != -1:
+                    model_end = next_any_turn
                 else:
                     model_end = len(full_text)
 
@@ -608,10 +610,7 @@ def load_base(args: argparse.Namespace, model_path: str):
             kwargs["device_map"] = "auto"  # ~8B params need both T4s in half precision
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-    if args.resume_from:
-        model = PeftModel.from_pretrained(model, args.resume_from, is_trainable=True)
-        print(f"[model] resumed adapter from {args.resume_from}")
-    elif args.use_4bit:
+    if args.use_4bit:
         model = prepare_for_kbit_training(model)
         gc.collect()
         torch.cuda.empty_cache()
@@ -619,6 +618,9 @@ def load_base(args: argparse.Namespace, model_path: str):
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
         model.config.use_cache = False
+    if args.resume_from:
+        model = PeftModel.from_pretrained(model, args.resume_from, is_trainable=True)
+        print(f"[model] resumed adapter from {args.resume_from}")
     return model
 
 
