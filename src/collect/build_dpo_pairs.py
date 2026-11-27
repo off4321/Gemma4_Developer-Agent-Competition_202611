@@ -811,9 +811,9 @@ def main() -> int:
     default_output = "data/dpo_pairs.jsonl" if args.role == "main" else f"data/dpo_pairs_{args.role}.jsonl"
     out = Path(args.output or default_output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as fh:
+    with out.open("w", encoding="utf-8", newline="\n") as fh:
         for row in pairs:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(row, ensure_ascii=True) + "\n")
 
     self_play = sum(1 for r in pairs if r["meta"]["source"] == "self_play")
     reasons: dict[str, int] = defaultdict(int)

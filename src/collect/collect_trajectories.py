@@ -1754,9 +1754,9 @@ def main() -> int:
 
     out = Path(args.output or ROLE_DEFAULT_OUTPUTS[args.role])
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as fh:
+    with out.open("w", encoding="utf-8", newline="\n") as fh:
         for record in records:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(record, ensure_ascii=True) + "\n")
 
     n_calls = [sum(1 for m in r["messages"] if m.get("tool_calls")) for r in records]
     avg_len = sum(len(json.dumps(r["messages"])) for r in records) / max(1, len(records))

@@ -181,22 +181,30 @@ def load_dpo_dataset(
         raise SystemExit(f"[error] DPO data not found: {path} (run src/collect/build_dpo_pairs.py first)")
 
     rows: list[dict[str, str]] = []
-    for line in data_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        prompt, chosen, rejected = _render_pair_texts(
-            tokenizer,
-            item.get("prompt") or [],
-            item.get("chosen") or [],
-            item.get("rejected") or [],
-            max_len=max_len,
-            keep_prior_thoughts=keep_prior_thoughts,
-        )
-        if prompt and chosen and rejected:
-            rows.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
-        if max_examples and len(rows) >= max_examples:
-            break
+    bad_lines = 0
+    with data_path.open("r", encoding="utf-8", newline="\n") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                bad_lines += 1
+                continue
+            prompt, chosen, rejected = _render_pair_texts(
+                tokenizer,
+                item.get("prompt") or [],
+                item.get("chosen") or [],
+                item.get("rejected") or [],
+                max_len=max_len,
+                keep_prior_thoughts=keep_prior_thoughts,
+            )
+            if prompt and chosen and rejected:
+                rows.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
+            if max_examples and len(rows) >= max_examples:
+                break
+    if bad_lines:
+        print(f"[warn] skipped {bad_lines} malformed DPO JSONL line(s) in {path}")
 
     if not rows:
         raise SystemExit(f"[error] no usable preference pairs in {path}")
