@@ -31,6 +31,7 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +122,11 @@ def parse_args() -> argparse.Namespace:
                    help="auto: bfloat16 on Ampere+ (the 4x L4 scorer), float16 on Kaggle T4 x2")
     p.add_argument("--use_4bit", action="store_true", help="QLoRA (fit on a single 16 GB T4)")
     p.add_argument("--no_4bit", dest="use_4bit", action="store_false")
+    p.add_argument("--grad_ckpt", action="store_true", default=True,
+                   help="enable non-reentrant gradient checkpointing (use --no_grad_ckpt on 80GB GPU for +25-35%% speed)")
+    p.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
+    p.add_argument("--attn_implementation", default="sdpa",
+                   help="attention backend (sdpa / flash_attention_2 / eager)")
     p.add_argument("--log_every", type=int, default=2)
     p.add_argument("--save_every", type=int, default=200,
                    help="save intermediate checkpoint to out_dir every N optimizer steps (0 disables)")
@@ -554,7 +560,7 @@ def build_dataset(tokenizer: AutoTokenizer, conversations: list[Conversation], a
     # print the supervised text so a broken tool-call serialisation is visible before training starts
     supervised_ids = [t for t, label in zip(rows[0]["input_ids"], rows[0]["labels"]) if label != IGNORE]
     print("[data] sample supervised text:\n" + tokenizer.decode(supervised_ids))
-    return Dataset.from_list(rows)
+    return rows
 
 
 class Collator:
@@ -585,38 +591,62 @@ def quantization_config():
                               bnb_4bit_compute_dtype=auto_dtype(), bnb_4bit_use_double_quant=True)
 
 
-def prepare_for_kbit_training(model):
+def _enable_grad_ckpt(model) -> None:
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except TypeError:
+        model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+
+
+def prepare_for_kbit_training(model, grad_ckpt: bool = True):
     """Freeze the 4-bit base and enable gradient checkpointing without fp32-upcasting 262k-vocab lm_head."""
     for param in model.parameters():
         param.requires_grad = False
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    if grad_ckpt:
+        _enable_grad_ckpt(model)
     model.config.use_cache = False
     return model
 
 
 def load_base(args: argparse.Namespace, model_path: str):
-    """Load the base weights, wrap a `--resume_from` adapter, and enable the memory savers."""
+    """Load the base weights, enable SDPA / memory savers, and wrap `--resume_from` if provided."""
     kwargs: dict[str, Any] = {"trust_remote_code": True}
+    single_gpu = torch.cuda.is_available() and torch.cuda.device_count() == 1
+    attn_impl = getattr(args, "attn_implementation", "sdpa")
+    if attn_impl and torch.cuda.is_available():
+        kwargs["attn_implementation"] = attn_impl
     if args.use_4bit and torch.cuda.is_available():
         kwargs["quantization_config"] = quantization_config()
         kwargs["torch_dtype"] = auto_dtype()
         kwargs["device_map"] = "auto"
-        print(f"[model] QLoRA: 4-bit NF4 base weights (non-quantized={kwargs['torch_dtype']})")
+        print(f"[model] QLoRA: 4-bit NF4 base weights (non-quantized={kwargs['torch_dtype']}, attn={attn_impl})")
     else:
         kwargs["torch_dtype"] = auto_dtype() if args.dtype == "auto" else DTYPES[args.dtype]
-        print(f"[model] torch_dtype={kwargs['torch_dtype']} (T4 x2 has no bf16 matmul support -> float16 there)")
-        if torch.cuda.is_available():
+        print(f"[model] torch_dtype={kwargs['torch_dtype']} attn={attn_impl} single_gpu={single_gpu}")
+        if torch.cuda.is_available() and not single_gpu:
             kwargs["device_map"] = "auto"  # ~8B params need both T4s in half precision
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    except Exception as exc:
+        if "attn_implementation" in kwargs:
+            print(f"[model] attn_implementation={attn_impl!r} unsupported ({exc}); falling back to default")
+            kwargs.pop("attn_implementation", None)
+            model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+        else:
+            raise
+    if single_gpu and not args.use_4bit:
+        model = model.to("cuda")
+
+    grad_ckpt = bool(getattr(args, "grad_ckpt", True))
     if args.use_4bit:
-        model = prepare_for_kbit_training(model)
+        model = prepare_for_kbit_training(model, grad_ckpt=grad_ckpt)
         gc.collect()
         torch.cuda.empty_cache()
     else:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        if grad_ckpt:
+            _enable_grad_ckpt(model)
         model.config.use_cache = False
     if args.resume_from:
         model = PeftModel.from_pretrained(model, args.resume_from, is_trainable=True)
@@ -661,17 +691,30 @@ def build_lora_config(args: argparse.Namespace, model=None) -> LoraConfig:
 
 
 def build_optimizer(model, args: argparse.Namespace) -> torch.optim.AdamW:
-    """Create AdamW with optional LoRA+ asymmetric learning rate for `lora_B`."""
+    """Create fused CUDA AdamW with optional LoRA+ asymmetric learning rate for `lora_B`."""
     ratio = getattr(args, "lora_plus_ratio", 1.0)
+    use_fused = torch.cuda.is_available()
+    opt_kwargs: dict[str, Any] = {"weight_decay": args.weight_decay}
+    if use_fused:
+        opt_kwargs["fused"] = True
+
     if ratio <= 1.0:
         trainable = [p for p in model.parameters() if p.requires_grad]
-        return torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+        try:
+            return torch.optim.AdamW(trainable, lr=args.lr, **opt_kwargs)
+        except (TypeError, RuntimeError):
+            opt_kwargs.pop("fused", None)
+            return torch.optim.AdamW(trainable, lr=args.lr, **opt_kwargs)
 
     lora_b = [p for n, p in model.named_parameters() if p.requires_grad and "lora_B" in n]
     other = [p for n, p in model.named_parameters() if p.requires_grad and "lora_B" not in n]
     groups = [{"params": other, "lr": args.lr}, {"params": lora_b, "lr": args.lr * ratio}]
     print(f"[train] LoRA+ enabled: lr={args.lr:.2e}, lora_B lr={args.lr * ratio:.2e} (x{ratio:g})")
-    return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+    try:
+        return torch.optim.AdamW(groups, **opt_kwargs)
+    except (TypeError, RuntimeError):
+        opt_kwargs.pop("fused", None)
+        return torch.optim.AdamW(groups, **opt_kwargs)
 
 
 # ---------------------------------------------------------------------------------- training
@@ -729,61 +772,210 @@ def register_neftune_hook(model, alpha: float):
     return emb.register_forward_hook(_hook)
 
 
-def training_step(model, example: dict[str, Any], index: int, device: torch.device,
-                  collator: Collator, args: argparse.Namespace) -> float | None:
-    """Forward one example and accumulate its gradient; return the raw loss, or None on OOM.
+def _get_backbone_and_lm_head(model) -> tuple[Any, Any, float | None]:
+    """Return `(text_backbone, lm_head, final_logit_softcapping)` for masked lm_head / Liger CE."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    lm_head = base.get_output_embeddings() if hasattr(base, "get_output_embeddings") else getattr(base, "lm_head", None)
+    cfg = getattr(base, "config", None)
+    text_cfg = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    softcap = getattr(text_cfg, "final_logit_softcapping", None) if text_cfg is not None else None
+    if softcap is not None and float(softcap) <= 0:
+        softcap = None
+    # Multimodal Gemma 4 (`Gemma4ForConditionalGeneration`) may expose `model.language_model` or `language_model.model`
+    backbone = None
+    if hasattr(base, "model") and hasattr(base.model, "language_model"):
+        backbone = base.model.language_model
+    elif hasattr(base, "language_model"):
+        lm = base.language_model
+        backbone = getattr(lm, "model", lm)
+    elif hasattr(base, "model"):
+        backbone = base.model
+    return backbone, lm_head, (float(softcap) if softcap is not None else None)
 
-    A trajectory that does not fit is dropped instead of killing a whole afternoon run.
-    """
-    weight = float(example.get("weight", 1.0))
-    clean_ex = {k: example[k] for k in ("input_ids", "labels", "attention_mask")}
-    batch = {key: value.to(device) for key, value in collator([clean_ex]).items()}
-    labels = batch.pop("labels")
+
+def _build_liger_ce(softcap: float | None):
+    """Return `LigerFusedLinearCrossEntropyLoss` if `liger-kernel` is installed, else None."""
     try:
-        logits = model(**batch).logits
-        loss = chunked_causal_lm_loss(logits, labels)
-        (loss * weight / args.grad_accum).backward()
+        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+        kwargs: dict[str, Any] = {"ignore_index": IGNORE, "reduction": "mean"}
+        if softcap is not None:
+            kwargs["softcap"] = softcap
+        ce = LigerFusedLinearCrossEntropyLoss(**kwargs)
+        print(f"[train] LigerFusedLinearCrossEntropyLoss enabled (softcap={softcap})")
+        return ce
+    except Exception:
+        return None
+
+
+def masked_lm_head_loss(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    lm_head: torch.nn.Module,
+    softcap: float | None = None,
+    liger_ce: Any = None,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Apply `lm_head` + shifted CE ONLY on `labels != IGNORE` tokens (~85% fewer lm_head FLOPs, 0 full-logits allocation)."""
+    shift_hidden = hidden_states[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    mask = shift_labels != IGNORE
+    if not mask.any():
+        return hidden_states.sum() * 0.0
+
+    valid_hidden = shift_hidden[mask]  # [N_valid, H]
+    valid_labels = shift_labels[mask]  # [N_valid]
+
+    if (
+        liger_ce is not None
+        and valid_hidden.is_cuda
+        and hasattr(lm_head, "weight")
+        and getattr(lm_head, "bias", None) is None
+    ):
+        return liger_ce(lm_head.weight, valid_hidden, valid_labels)
+
+    total_loss = valid_hidden.new_zeros((), dtype=torch.float32)
+    n_valid = valid_labels.numel()
+
+    def _proj_ce(h_chunk: torch.Tensor, y_chunk: torch.Tensor) -> torch.Tensor:
+        sub_logits = lm_head(h_chunk).float()
+        if softcap is not None:
+            sub_logits = torch.tanh(sub_logits / softcap) * softcap
+        return torch.nn.functional.cross_entropy(sub_logits, y_chunk, ignore_index=IGNORE, reduction="sum")
+
+    for start in range(0, n_valid, chunk_size):
+        end = min(start + chunk_size, n_valid)
+        h_chunk = valid_hidden[start:end]
+        y_chunk = valid_labels[start:end]
+        if h_chunk.requires_grad:
+            chunk_loss = torch.utils.checkpoint.checkpoint(_proj_ce, h_chunk, y_chunk, use_reentrant=False)
+        else:
+            chunk_loss = _proj_ce(h_chunk, y_chunk)
+        total_loss = total_loss + chunk_loss
+    return total_loss / n_valid
+
+
+def training_step(
+    model,
+    examples: list[dict[str, Any]],
+    step_idx: int,
+    device: torch.device,
+    collator: Collator,
+    args: argparse.Namespace,
+    fast_state: dict[str, Any],
+) -> torch.Tensor | None:
+    """Forward a micro-batch and accumulate its gradient; return detached GPU loss tensor, or None on OOM."""
+    avg_weight = sum(float(ex.get("weight", 1.0)) for ex in examples) / max(1, len(examples))
+    clean_batch = [{k: ex[k] for k in ("input_ids", "labels", "attention_mask")} for ex in examples]
+    batch = {key: value.to(device, non_blocking=True) for key, value in collator(clean_batch).items()}
+    labels = batch.pop("labels")
+    # Drop attention_mask when unpadded so SDPA hits native FlashAttention `is_causal=True`
+    if "attention_mask" in batch and bool(batch["attention_mask"].all()):
+        batch.pop("attention_mask")
+    try:
+        backbone = fast_state.get("backbone")
+        lm_head = fast_state.get("lm_head")
+        loss = None
+        if backbone is not None and lm_head is not None and fast_state.get("use_masked_head", True):
+            try:
+                out = backbone(**batch, use_cache=False)
+                hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+                if hidden.size(-1) == lm_head.weight.size(1):
+                    loss = masked_lm_head_loss(
+                        hidden,
+                        labels,
+                        lm_head,
+                        softcap=fast_state.get("softcap"),
+                        liger_ce=fast_state.get("liger_ce"),
+                    )
+                else:
+                    fast_state["use_masked_head"] = False
+            except Exception as exc:
+                if not fast_state.get("fallback_logged"):
+                    print(f"[train] masked lm_head path unavailable ({exc}); falling back to full logits + chunked CE")
+                    fast_state["fallback_logged"] = True
+                fast_state["use_masked_head"] = False
+        if loss is None:
+            logits = model(**batch).logits
+            loss = chunked_causal_lm_loss(logits, labels)
+        (loss * avg_weight / args.grad_accum).backward()
     except torch.cuda.OutOfMemoryError:
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
-        print(f"[warn] OOM at sample {index} (len={len(example['input_ids'])}), skipping")
+        lens = [len(ex["input_ids"]) for ex in examples]
+        print(f"[warn] OOM at micro-batch {step_idx} (lens={lens}), skipping")
         return None
-    return float(loss.detach())
+    return loss.detach()
 
 
-def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Namespace) -> None:
-    """Manual epoch loop: shuffle, accumulate `grad_accum` single-example micro-steps, then step.
+def _make_length_bucketed_batches(rows: list[Example], batch_size: int) -> list[list[int]]:
+    """Group similarly-sized trajectories into batches to minimize right-padding waste."""
+    indices = list(range(len(rows)))
+    if batch_size <= 1:
+        random.shuffle(indices)
+        return [[idx] for idx in indices]
+    # Sort by length, partition into moderately-sized buckets, shuffle inside each bucket, then shuffle batches
+    indices.sort(key=lambda idx: len(rows[idx]["input_ids"]))
+    bucket_size = batch_size * 32
+    batches: list[list[int]] = []
+    for start in range(0, len(indices), bucket_size):
+        bucket = indices[start: start + bucket_size]
+        random.shuffle(bucket)
+        for b_start in range(0, len(bucket), batch_size):
+            batches.append(bucket[b_start: b_start + batch_size])
+    random.shuffle(batches)
+    return batches
 
-    One example at a time (not `batch_size`) keeps peak memory predictable at long max_len.
-    """
+
+def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, args: argparse.Namespace) -> None:
+    """Manual epoch loop with length-bucketed batching, masked lm_head/Liger CE, and async GPU loss tracking."""
+    rows: list[Example] = list(dataset) if not isinstance(dataset, list) else dataset
+    batch_size = max(1, int(getattr(args, "batch_size", 1) or 1))
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = build_optimizer(model, args)
-    total_steps = int(max(1, len(dataset) // args.grad_accum) * args.epochs)
+    batches_per_epoch = math.ceil(len(rows) / batch_size)
+    total_steps = max(1, int(math.ceil(batches_per_epoch / args.grad_accum) * args.epochs))
     warmup = min(args.warmup_steps, max(1, total_steps // 5))
     sched_name = getattr(args, "lr_scheduler", "cosine")
     if sched_name == "cosine":
         scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
     else:
         scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
-    print(f"[train] scheduler={sched_name}, warmup_steps={warmup}, total_steps={total_steps}")
+    print(f"[train] scheduler={sched_name}, warmup_steps={warmup}, total_steps={total_steps}, "
+          f"batch_size={batch_size}, grad_accum={args.grad_accum}")
     device = torch.device(next(model.parameters()).device)
     collator = Collator(tokenizer)
     neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
 
+    backbone, lm_head, softcap = _get_backbone_and_lm_head(model)
+    liger_ce = _build_liger_ce(softcap) if (backbone is not None and lm_head is not None) else None
+    fast_state: dict[str, Any] = {
+        "backbone": backbone,
+        "lm_head": lm_head,
+        "softcap": softcap,
+        "liger_ce": liger_ce,
+        "use_masked_head": backbone is not None and lm_head is not None,
+    }
+    print(f"[train] masked_lm_head={fast_state['use_masked_head']} liger={liger_ce is not None} softcap={softcap}")
+
     model.train()
-    global_step, running_loss = 0, 0.0
+    global_step = 0
+    running_loss = torch.zeros((), device=device, dtype=torch.float32)
+    valid_microsteps = 0
+    t_start = time.monotonic()
     try:
         for epoch in range(math.ceil(args.epochs)):
-            order = list(range(len(dataset)))
-            random.shuffle(order)
+            batches = _make_length_bucketed_batches(rows, batch_size)
             optimizer.zero_grad(set_to_none=True)
 
-            for step, index in enumerate(order):
-                loss = training_step(model, dataset[index], index, device, collator, args)
+            for step, batch_indices in enumerate(batches):
+                examples = [rows[idx] for idx in batch_indices]
+                loss = training_step(model, examples, step, device, collator, args, fast_state)
                 if loss is None:
-                    continue  # OOM: the accumulation window simply stays short
-                running_loss += loss
-                if (step + 1) % args.grad_accum:
+                    continue
+                running_loss = running_loss + loss.float()
+                valid_microsteps += 1
+                is_last_batch = (step + 1) == len(batches)
+                if (step + 1) % args.grad_accum and not is_last_batch:
                     continue
 
                 torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
@@ -795,13 +987,19 @@ def train(model, dataset: Dataset, tokenizer: AutoTokenizer, args: argparse.Name
                 if save_every > 0 and global_step % save_every == 0:
                     save_adapter(model, args)
                     print(f"[train] intermediate checkpoint saved at step {global_step}/{total_steps}")
-                if global_step % args.log_every:
-                    continue
-                avg = running_loss / (args.log_every * args.grad_accum)
-                running_loss = 0.0
-                print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
-                      f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
-                      f"mem {torch.cuda.max_memory_allocated() / 1024**3:.1f} GiB")
+                if global_step % args.log_every == 0 or global_step == total_steps:
+                    avg = (running_loss / max(1, valid_microsteps)).item()
+                    running_loss.zero_()
+                    valid_microsteps = 0
+                    elapsed = time.monotonic() - t_start
+                    sec_per_step = elapsed / max(1, global_step)
+                    eta_min = sec_per_step * max(0, total_steps - global_step) / 60.0
+                    mem_gb = (torch.cuda.max_memory_allocated() / 1024**3) if torch.cuda.is_available() else 0.0
+                    print(f"[train] epoch {epoch} step {global_step}/{total_steps} "
+                          f"loss {avg:.4f} lr {scheduler.get_last_lr()[0]:.2e} "
+                          f"{sec_per_step:.1f}s/step ETA {eta_min:.1f}m mem {mem_gb:.1f} GiB")
+                if global_step >= total_steps:
+                    break
     except KeyboardInterrupt:
         print(f"[train] interrupted at step {global_step}; saving latest adapter to {args.out_dir}")
         save_adapter(model, args)
@@ -853,6 +1051,11 @@ def save_adapter(model, args: argparse.Namespace) -> None:
 
 # --------------------------------------------------------------------------------------- run
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     args = parse_args()
     torch.manual_seed(args.seed)
     random.seed(args.seed)

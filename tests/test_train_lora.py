@@ -233,3 +233,40 @@ def test_encode_conversation_supervises_all_turns_inside_single_gemma4_model_tur
     assert "SECRET_OBS_3" not in sup
     assert "<|tool_response>" not in sup
     assert "<tool_response|>" not in sup
+
+
+def test_masked_lm_head_loss_matches_chunked_causal_lm_loss_with_and_without_softcap() -> None:
+    import torch
+
+    torch.manual_seed(7)
+    bsz, seq_len, hidden_dim, vocab = 2, 19, 16, 41
+    lm_head = torch.nn.Linear(hidden_dim, vocab, bias=False)
+    labels = torch.full((bsz, seq_len), train_lora.IGNORE, dtype=torch.long)
+    labels[0, 3:8] = torch.tensor([1, 5, 12, 3, 20])
+    labels[1, 10:17] = torch.tensor([0, 7, 11, 19, 25, 31, 40])
+
+    for softcap in (None, 30.0):
+        h1 = torch.randn(bsz, seq_len, hidden_dim, requires_grad=True)
+        h2 = h1.detach().clone().requires_grad_(True)
+
+        logits = lm_head(h1)
+        if softcap is not None:
+            logits = torch.tanh(logits / softcap) * softcap
+        ref_loss = train_lora.chunked_causal_lm_loss(logits, labels, chunk_size=4)
+        ref_loss.backward()
+
+        lm_head.zero_grad()
+        fast_loss = train_lora.masked_lm_head_loss(h2, labels, lm_head, softcap=softcap, liger_ce=None, chunk_size=4)
+        fast_loss.backward()
+
+        assert torch.allclose(fast_loss, ref_loss, atol=1e-5, rtol=1e-5)
+        assert h1.grad is not None and h2.grad is not None
+        assert torch.allclose(h2.grad, h1.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_make_length_bucketed_batches_preserves_all_indices() -> None:
+    rows = [{"input_ids": [1] * (i * 10 + 5), "labels": [-100], "attention_mask": [1]} for i in range(25)]
+    batches = train_lora._make_length_bucketed_batches(rows, batch_size=2)
+    flat = [idx for b in batches for idx in b]
+    assert sorted(flat) == list(range(25))
+    assert all(1 <= len(b) <= 2 for b in batches)
