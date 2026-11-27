@@ -41,6 +41,7 @@ import torch.utils.checkpoint
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
@@ -89,6 +90,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=float, default=1.0,
                    help="1.0 epoch over ~1000 step-SFT examples (~120 updates) avoids memorising short-thought reflexes")
     p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--max_tokens_per_batch", type=int, default=0,
+                   help="dynamic token-budget batching (e.g. 20480 packs 3k seqs x6 and runs 16k solo; 0 uses --batch_size)")
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-5,
                    help="3e-5 gentle LR preserves base gemma-4-e4b-it multi-step error recovery")
@@ -647,15 +650,53 @@ def _patch_text_attention(model, attn_impl: str) -> int:
     return patched
 
 
+def _offload_unused_multimodal_towers(model) -> int:
+    """Keep unused vision/audio towers off GPU VRAM (~7 GiB saved on Gemma 4 e4b)."""
+    offloaded_params = 0
+    tower_names = ("vision_tower", "audio_tower", "vision_model", "audio_model", "embed_vision", "embed_audio")
+    containers = [model, getattr(model, "model", None)]
+    for container in containers:
+        if container is None:
+            continue
+        for attr in tower_names:
+            mod = getattr(container, attr, None)
+            if isinstance(mod, torch.nn.Module):
+                n_params = sum(p.numel() for p in mod.parameters())
+                if n_params > 0:
+                    mod.to("cpu")
+                    for p in mod.parameters():
+                        p.requires_grad = False
+                    offloaded_params += n_params
+    return offloaded_params
+
+
 def load_base(args: argparse.Namespace, model_path: str):
-    """Load the base weights, enable Liger / FlexAttention / memory savers, and wrap `--resume_from` if provided."""
+    """Load the base weights, configure text-only attention pre-init, offload vision/audio towers, and wrap `--resume_from`."""
     if torch.cuda.is_available():
         _apply_liger_gemma4_layers()
     kwargs: dict[str, Any] = {"trust_remote_code": True}
     single_gpu = torch.cuda.is_available() and torch.cuda.device_count() == 1
     attn_impl = getattr(args, "attn_implementation", "flex_attention")
+
+    # Configure text_config._attn_implementation BEFORE from_pretrained so Gemma4TextModel builds with it natively
+    # while Gemma4AudioModel stays on eager and never rejects initialization.
+    cfg = None
     if attn_impl and torch.cuda.is_available():
-        kwargs["attn_implementation"] = attn_impl
+        try:
+            cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            text_cfg = getattr(cfg, "text_config", None)
+            if text_cfg is not None:
+                text_cfg._attn_implementation = attn_impl
+                audio_cfg = getattr(cfg, "audio_config", None)
+                if audio_cfg is not None:
+                    audio_cfg._attn_implementation = "eager"
+                kwargs["config"] = cfg
+            else:
+                kwargs["attn_implementation"] = attn_impl
+        except Exception as exc:
+            print(f"[model] AutoConfig pre-patch skipped ({exc})")
+            kwargs["attn_implementation"] = attn_impl
+
     if args.use_4bit and torch.cuda.is_available():
         kwargs["quantization_config"] = quantization_config()
         kwargs["torch_dtype"] = auto_dtype()
@@ -670,17 +711,24 @@ def load_base(args: argparse.Namespace, model_path: str):
     try:
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     except Exception as exc:
-        if "attn_implementation" in kwargs:
-            print(f"[model] top-level attn_implementation={attn_impl!r} unsupported ({exc}); "
-                  f"loading default and patching text backbone to {attn_impl!r}")
+        if "config" in kwargs or "attn_implementation" in kwargs:
+            print(f"[model] attn_implementation={attn_impl!r} init failed ({exc}); loading default + post-patching")
+            kwargs.pop("config", None)
             kwargs.pop("attn_implementation", None)
             model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
             patched = _patch_text_attention(model, attn_impl)
-            print(f"[model] patched text backbone attention -> {attn_impl!r} ({patched} config refs)")
+            print(f"[model] post-patched text backbone attention -> {attn_impl!r} ({patched} config refs)")
         else:
             raise
+
     if single_gpu and not args.use_4bit:
+        # Move text backbone & lm_head to GPU, keeping unused vision/audio towers on CPU (~7 GiB VRAM saved)
         model = model.to("cuda")
+        offloaded = _offload_unused_multimodal_towers(model)
+        if offloaded:
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f"[model] offloaded {offloaded / 1e6:.1f}M unused vision/audio params to CPU (~{offloaded * 2 / 1024**3:.1f} GiB VRAM saved)")
 
     grad_ckpt = bool(getattr(args, "grad_ckpt", True))
     if args.use_4bit:
@@ -911,9 +959,10 @@ def training_step(
     clean_batch = [{k: ex[k] for k in ("input_ids", "labels", "attention_mask")} for ex in examples]
     batch = {key: value.to(device, non_blocking=True) for key, value in collator(clean_batch).items()}
     labels = batch.pop("labels")
-    # Drop attention_mask when unpadded so SDPA hits native FlashAttention `is_causal=True`
-    if "attention_mask" in batch and bool(batch["attention_mask"].all()):
-        batch.pop("attention_mask")
+    # Drop attention_mask on CPU check (no GPU->CPU sync) when all sequences in micro-batch have equal length
+    all_unpadded = len({len(ex["input_ids"]) for ex in examples}) == 1
+    if all_unpadded:
+        batch.pop("attention_mask", None)
     try:
         backbone = fast_state.get("backbone")
         lm_head = fast_state.get("lm_head")
@@ -967,16 +1016,40 @@ def training_step(
     return loss.detach()
 
 
-def _make_length_bucketed_batches(rows: list[Example], batch_size: int) -> list[list[int]]:
-    """Group similarly-sized trajectories into batches to minimize right-padding waste."""
+def _make_length_bucketed_batches(
+    rows: list[Example],
+    batch_size: int,
+    max_tokens_per_batch: int = 0,
+) -> list[list[int]]:
+    """Group similarly-sized trajectories into fixed-size or dynamic token-budget batches."""
     indices = list(range(len(rows)))
+    if max_tokens_per_batch > 0:
+        indices.sort(key=lambda idx: len(rows[idx]["input_ids"]))
+        batches: list[list[int]] = []
+        cur: list[int] = []
+        cur_max_len = 0
+        for idx in indices:
+            seq_len = len(rows[idx]["input_ids"])
+            cand_max = max(cur_max_len, seq_len)
+            if cur and cand_max * (len(cur) + 1) > max_tokens_per_batch:
+                batches.append(cur)
+                cur = [idx]
+                cur_max_len = seq_len
+            else:
+                cur.append(idx)
+                cur_max_len = cand_max
+        if cur:
+            batches.append(cur)
+        random.shuffle(batches)
+        return batches
+
     if batch_size <= 1:
         random.shuffle(indices)
         return [[idx] for idx in indices]
     # Sort by length, partition into moderately-sized buckets, shuffle inside each bucket, then shuffle batches
     indices.sort(key=lambda idx: len(rows[idx]["input_ids"]))
     bucket_size = batch_size * 32
-    batches: list[list[int]] = []
+    batches = []
     for start in range(0, len(indices), bucket_size):
         bucket = indices[start: start + bucket_size]
         random.shuffle(bucket)
@@ -987,12 +1060,14 @@ def _make_length_bucketed_batches(rows: list[Example], batch_size: int) -> list[
 
 
 def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, args: argparse.Namespace) -> None:
-    """Manual epoch loop with length-bucketed batching, masked lm_head/Liger CE, and async GPU loss tracking."""
+    """Manual epoch loop with dynamic token-budget or length-bucketed batching, masked lm_head/Liger CE, and async GPU loss tracking."""
     rows: list[Example] = list(dataset) if not isinstance(dataset, list) else dataset
     batch_size = max(1, int(getattr(args, "batch_size", 1) or 1))
+    max_tok_batch = max(0, int(getattr(args, "max_tokens_per_batch", 0) or 0))
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = build_optimizer(model, args)
-    batches_per_epoch = math.ceil(len(rows) / batch_size)
+    sample_batches = _make_length_bucketed_batches(rows, batch_size, max_tokens_per_batch=max_tok_batch)
+    batches_per_epoch = len(sample_batches)
     total_steps = max(1, int(math.ceil(batches_per_epoch / args.grad_accum) * args.epochs))
     warmup = min(args.warmup_steps, max(1, total_steps // 5))
     sched_name = getattr(args, "lr_scheduler", "cosine")
@@ -1001,7 +1076,8 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     else:
         scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
     print(f"[train] scheduler={sched_name}, warmup_steps={warmup}, total_steps={total_steps}, "
-          f"batch_size={batch_size}, grad_accum={args.grad_accum}")
+          f"batch_size={batch_size}, max_tokens_per_batch={max_tok_batch}, "
+          f"batches/epoch={batches_per_epoch}, grad_accum={args.grad_accum}")
     device = torch.device(next(model.parameters()).device)
     collator = Collator(tokenizer)
     neftune_handle = register_neftune_hook(model, float(getattr(args, "neftune_alpha", 0.0) or 0.0))
@@ -1024,7 +1100,7 @@ def train(model, dataset: list[Example] | Dataset, tokenizer: AutoTokenizer, arg
     t_start = time.monotonic()
     try:
         for epoch in range(math.ceil(args.epochs)):
-            batches = _make_length_bucketed_batches(rows, batch_size)
+            batches = _make_length_bucketed_batches(rows, batch_size, max_tokens_per_batch=max_tok_batch)
             optimizer.zero_grad(set_to_none=True)
 
             for step, batch_indices in enumerate(batches):

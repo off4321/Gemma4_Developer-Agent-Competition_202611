@@ -270,3 +270,11 @@ def test_make_length_bucketed_batches_preserves_all_indices() -> None:
     flat = [idx for b in batches for idx in b]
     assert sorted(flat) == list(range(25))
     assert all(1 <= len(b) <= 2 for b in batches)
+
+    dyn_batches = train_lora._make_length_bucketed_batches(rows, batch_size=1, max_tokens_per_batch=300)
+    dyn_flat = [idx for b in dyn_batches for idx in b]
+    assert sorted(dyn_flat) == list(range(25))
+    # Every batch respects the token budget (except singletons longer than budget)
+    for b in dyn_batches:
+        if len(b) > 1:
+            assert max(len(rows[i]["input_ids"]) for i in b) * len(b) <= 300
